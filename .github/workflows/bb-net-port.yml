@@ -1,0 +1,109 @@
+name: BB DLSS + upstream networking build
+
+# Builds shadPS4.exe for branches that port upstream networking into the DLSS-FSR fork.
+# Publishes the build log to build-logs/<branch> and, on success, a prerelease with the exe.
+on:
+  push:
+    branches:
+      - "bb-net-port"
+      - "bb-net-port-*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bb-net-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  windows:
+    runs-on: windows-2025-vs2026
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        submodules: recursive
+
+    - name: Cache CMake Build
+      uses: hendrikmuhs/ccache-action@v1.2.21
+      with:
+        append-timestamp: false
+        key: bb-net-${{ runner.os }}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
+
+    - name: Configure
+      id: configure
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -o pipefail
+        mkdir -p ci-logs
+        cmake --fresh -G Ninja -B build -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
+          -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON \
+          -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl \
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache 2>&1 | tee ci-logs/configure.log
+
+    - name: Build
+      id: build
+      if: steps.configure.outcome == 'success'
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -o pipefail
+        cmake --build build --config $BUILD_TYPE --parallel $NUMBER_OF_PROCESSORS -- -k 0 2>&1 | tee ci-logs/build.log
+
+    - name: Collect errors
+      if: always()
+      shell: bash
+      run: |
+        mkdir -p ci-logs
+        grep -n -E "error( |:)|fatal error|undefined symbol|unresolved external" ci-logs/build.log > ci-logs/errors.log 2>/dev/null || true
+        grep -n -E "warning:" ci-logs/build.log | grep -E "src/core/(libraries/(np|network|net)|net)|src/shadnet|emulator_settings" > ci-logs/net-warnings.log 2>/dev/null || true
+
+    - name: Publish prerelease
+      if: steps.build.outcome == 'success'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        short=$(git rev-parse --short=8 HEAD)
+        tag="${GITHUB_REF_NAME}-${short}"
+        mkdir -p out && cp build/shadPS4.exe out/shadPS4.exe
+        (cd out && 7z a -tzip "../shadPS4-$tag.zip" shadPS4.exe > /dev/null)
+        gh release create "$tag" "shadPS4-$tag.zip" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+          --prerelease --title "$tag" --notes "Automated build of $GITHUB_REF_NAME at $GITHUB_SHA (exe only)."
+        echo "$tag" > ci-logs/release-tag.txt
+
+    - name: Publish logs
+      if: always()
+      shell: bash
+      env:
+        CONFIGURE: ${{ steps.configure.outcome }}
+        BUILD: ${{ steps.build.outcome }}
+      run: |
+        mkdir -p ci-logs
+        {
+          echo "sha=$GITHUB_SHA"
+          echo "ref=$GITHUB_REF_NAME"
+          echo "run=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          echo "configure=$CONFIGURE"
+          echo "build=$BUILD"
+        } > ci-logs/status.txt
+        # keep the full log small enough for git
+        if [ -f ci-logs/build.log ]; then tail -c 3000000 ci-logs/build.log > ci-logs/build-tail.log; rm ci-logs/build.log; fi
+        work="$RUNNER_TEMP/logs"; rm -rf "$work"; mkdir -p "$work"; cp -r ci-logs/. "$work/"
+        cd "$work"
+        git init -q
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git checkout -q -b "build-logs/$GITHUB_REF_NAME"
+        git add -A
+        git commit -q -m "Build logs for $GITHUB_SHA ($CONFIGURE/$BUILD)"
+        git push -f "https://x-access-token:${{ github.token }}@github.com/$GITHUB_REPOSITORY.git" "HEAD:refs/heads/build-logs/$GITHUB_REF_NAME"
+
+    - name: Fail when the build failed
+      if: steps.build.outcome != 'success'
+      shell: bash
+      run: exit 1
