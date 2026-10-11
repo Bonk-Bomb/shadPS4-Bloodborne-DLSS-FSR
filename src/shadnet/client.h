@@ -4,6 +4,7 @@
 
 #pragma once
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -384,6 +385,13 @@ private:
     std::string m_password;
     std::string m_token;
     bool m_appear_offline = false; // user's Appear-Offline preference (sent at login)
+
+    // Why the reader stopped, for the drop log: recv() returning 0 is the peer closing cleanly,
+    // anything else is a socket error (reset, timeout, abort). Reader thread only.
+    bool m_last_recv_eof = false;
+    int m_last_recv_error = 0;
+    std::chrono::steady_clock::time_point m_connected_at{};
+    std::chrono::steady_clock::time_point m_last_packet_at{};
 
     std::atomic<bool> m_terminate{false};
     std::atomic<bool> m_connected{false};

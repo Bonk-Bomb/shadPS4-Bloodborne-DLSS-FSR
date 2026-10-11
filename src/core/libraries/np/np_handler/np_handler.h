@@ -393,6 +393,12 @@ private:
 
     // Disconnect and remove one user's client.
     void DisconnectUser(s32 user_id);
+    // A network drop: remove the dead client without telling the game. The user stays signed in
+    // from the game's point of view for kDropGracePeriod while the worker reconnects (a PS4 keeps
+    // its PSN session through short network blips; games never see them).
+    void SoftDisconnectUser(s32 user_id);
+    // Reports SignedOut for users whose grace period ran out without a reconnect.
+    void ExpireGracePeriods();
     // Fail every pending score/TUS request submitted by this user so pollers
     // and blocked WaitAsync callers wake up instead of hanging forever.
     void FailPendingRequests(s32 user_id, s32 error_code);
@@ -511,6 +517,21 @@ private:
         std::chrono::milliseconds backoff{0};
     };
     std::unordered_map<s32, ReconnectState> m_reconnect;
+
+    // Users whose connection dropped but who are still reported signed in, with the deadline for
+    // reporting SignedOut. Guarded by m_mutex_clients.
+    static constexpr std::chrono::seconds kDropGracePeriod{90};
+    std::unordered_map<s32, std::chrono::steady_clock::time_point> m_grace_until;
+
+    // Identity from the last successful login, answered while a user is in the grace period.
+    // Guarded by m_mutex_clients.
+    struct CachedIdentity {
+        OrbisNpAccountId account_id = 0;
+        std::string avatar_url;
+        std::string bearer_token;
+        u32 local_ip = 0;
+    };
+    std::unordered_map<s32, CachedIdentity> m_identity;
 
     mutable std::mutex m_mutex_pending_invites;
     std::unordered_map<s32, std::vector<PendingInvitation>> m_pending_invites;

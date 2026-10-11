@@ -15,6 +15,7 @@
 #include "shadnet.pb.h"
 
 #ifdef _WIN32
+#include <mstcpip.h>
 #pragma comment(lib, "Ws2_32.lib")
 static void PlatformInit() {
     static bool done = false;
@@ -24,9 +25,41 @@ static void PlatformInit() {
         done = true;
     }
 }
+static int LastSocketError() {
+    return WSAGetLastError();
+}
 #else
+#include <netinet/tcp.h>
 static void PlatformInit() {}
+static int LastSocketError() {
+    return errno;
+}
 #endif
+
+// Keepalive probes on our side too: they keep home-router/NAT state for an idle session fresh
+// and turn a silently dead path into a prompt error instead of a reader blocked forever.
+static void EnableKeepAlive(ShadSocketHandle sock) {
+#ifdef _WIN32
+    tcp_keepalive ka{};
+    ka.onoff = 1;
+    ka.keepalivetime = 30000;    // ms idle before the first probe
+    ka.keepaliveinterval = 5000; // ms between unanswered probes
+    DWORD returned = 0;
+    if (::WSAIoctl(sock, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &returned, nullptr,
+                   nullptr) != 0) {
+        LOG_WARNING(ShadNet, "could not enable TCP keepalive (error {})", LastSocketError());
+    }
+#else
+    int on = 1;
+    ::setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+#ifdef TCP_KEEPIDLE
+    int idle = 30, interval = 5, count = 6;
+    ::setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    ::setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+    ::setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
+#endif
+#endif
+}
 
 namespace ShadNet {
 
@@ -228,11 +261,27 @@ bool ShadNetClient::OnReaderThread() {
 void ShadNetClient::ReaderThread() {
     Common::SetCurrentThreadName("ShadNet:Reader");
     t_reader_thread = true;
+    m_last_packet_at = std::chrono::steady_clock::now();
     while (!m_terminate) {
         u8 hdr[SHAD_HEADER_SIZE];
         if (!RecvN(hdr, SHAD_HEADER_SIZE)) {
-            if (!m_terminate)
-                LOG_WARNING(ShadNet, "Reader header recv failed, disconnecting");
+            if (!m_terminate) {
+                using namespace std::chrono;
+                const auto now = steady_clock::now();
+                const auto up = duration_cast<seconds>(now - m_connected_at).count();
+                const auto quiet = duration_cast<seconds>(now - m_last_packet_at).count();
+                if (m_last_recv_eof) {
+                    LOG_WARNING(ShadNet,
+                                "Reader header recv failed: server closed the connection "
+                                "(connected {}s, last packet {}s ago), disconnecting",
+                                up, quiet);
+                } else {
+                    LOG_WARNING(ShadNet,
+                                "Reader header recv failed: socket error {} (connected {}s, "
+                                "last packet {}s ago), disconnecting",
+                                m_last_recv_error, up, quiet);
+                }
+            }
             break;
         }
         const auto ptype = static_cast<PacketType>(hdr[0]);
@@ -251,10 +300,13 @@ void ShadNetClient::ReaderThread() {
             payload.resize(payload_sz);
             if (!RecvN(payload.data(), payload_sz)) {
                 if (!m_terminate)
-                    LOG_WARNING(ShadNet, "Reader payload recv failed");
+                    LOG_WARNING(ShadNet, "Reader payload recv failed ({})",
+                                m_last_recv_eof ? std::string("server closed the connection")
+                                                : fmt::format("socket error {}", m_last_recv_error));
                 break;
             }
         }
+        m_last_packet_at = std::chrono::steady_clock::now();
         DispatchPacket(ptype, cmd_raw, pkt_id, payload);
     }
 
@@ -326,29 +378,46 @@ bool ShadNetClient::DoConnect() {
 #endif
 
     const int cr = ::connect(m_sock, res_list->ai_addr, static_cast<int>(res_list->ai_addrlen));
+    const int connect_error = cr < 0 ? LastSocketError() : 0;
     ::freeaddrinfo(res_list);
 
     bool connected = false;
+    std::string failure;
 #ifdef _WIN32
-    const bool in_progress = (cr < 0 && WSAGetLastError() == WSAEWOULDBLOCK);
+    const bool in_progress = (cr < 0 && connect_error == WSAEWOULDBLOCK);
 #else
-    const bool in_progress = (cr < 0 && errno == EINPROGRESS);
+    const bool in_progress = (cr < 0 && connect_error == EINPROGRESS);
 #endif
     if (cr == 0 || in_progress) {
-        fd_set wfds;
+        // Windows reports a failed non-blocking connect (refused, unreachable) in the except set
+        // only; without it select() sits out the whole timeout on a connection that already
+        // failed.
+        fd_set wfds, efds;
         FD_ZERO(&wfds);
+        FD_ZERO(&efds);
         FD_SET(m_sock, &wfds);
+        FD_SET(m_sock, &efds);
         struct timeval tv{static_cast<long>(SHAD_CONNECT_TIMEOUT_MS / 1000),
                           static_cast<long>((SHAD_CONNECT_TIMEOUT_MS % 1000) * 1000)};
-        if (::select(static_cast<int>(m_sock) + 1, nullptr, &wfds, nullptr, &tv) > 0) {
+        const int ready = ::select(static_cast<int>(m_sock) + 1, nullptr, &wfds, &efds, &tv);
+        if (ready > 0) {
             int err = 0;
             socklen_t len = sizeof(err);
             ::getsockopt(m_sock, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len);
-            connected = (err == 0);
+            connected = (err == 0) && FD_ISSET(m_sock, &wfds);
+            if (!connected)
+                failure = fmt::format("socket error {}", err);
+        } else if (ready == 0) {
+            failure = fmt::format("no answer within {} ms", SHAD_CONNECT_TIMEOUT_MS);
+        } else {
+            failure = fmt::format("select error {}", LastSocketError());
         }
+    } else {
+        failure = fmt::format("connect error {}", connect_error);
     }
     if (!connected) {
-        LOG_ERROR(ShadNet, "connect() timed out or failed for {}:{}", m_host, m_port);
+        LOG_ERROR(ShadNet, "connect() timed out or failed for {}:{} ({})", m_host, m_port,
+                  failure);
         SHAD_CLOSE(m_sock);
         m_sock = SHAD_INVALID_SOCK;
         m_state = ShadNetState::FailureConnect;
@@ -379,6 +448,8 @@ bool ShadNetClient::DoConnect() {
         m_addr_server.store(peer.sin_addr.s_addr);
 
     LOG_INFO(ShadNet, "TCP connected to {}:{}", m_host, m_port);
+    m_connected_at = std::chrono::steady_clock::now();
+    EnableKeepAlive(m_sock);
 
     // Apply receive timeout for the ServerInfo handshake.
     // Cleared after success so ReaderThread's RecvN blocks indefinitely as intended.
@@ -459,8 +530,11 @@ bool ShadNetClient::RecvN(u8* buf, u32 n) {
             return false;
         const int r = static_cast<int>(::recv(m_sock, reinterpret_cast<char*>(buf + received),
                                               static_cast<int>(n - received), 0));
-        if (r <= 0)
+        if (r <= 0) {
+            m_last_recv_eof = (r == 0);
+            m_last_recv_error = (r == 0) ? 0 : LastSocketError();
             return false;
+        }
         received += static_cast<u32>(r);
     }
     return true;

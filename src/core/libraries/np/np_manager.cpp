@@ -934,6 +934,9 @@ static void DispatchPendingNpStateCallbacks() {
     }
 
     for (auto& event : pending_events) {
+        // State changes are rare; logging both ends shows whether a game callback ever returns.
+        LOG_INFO(Lib_NpManager, "dispatching NP state {} for user_id={} to the game",
+                 static_cast<int>(event.state), event.user_id);
         if (legacy_callback.func != nullptr) {
             legacy_callback.func(event.user_id, event.state,
                                  event.has_np_id ? &event.np_id : nullptr,
@@ -953,6 +956,8 @@ static void DispatchPendingNpStateCallbacks() {
         if (toolkit_callback.func != nullptr) {
             toolkit_callback.func(event.user_id, event.state, toolkit_callback.userdata);
         }
+        LOG_INFO(Lib_NpManager, "game handled NP state {} for user_id={}",
+                 static_cast<int>(event.state), event.user_id);
     }
 
     // Reachability callback fires only on a change, after the state callbacks.

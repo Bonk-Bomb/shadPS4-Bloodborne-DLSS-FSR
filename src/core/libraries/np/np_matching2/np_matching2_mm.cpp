@@ -47,6 +47,9 @@ struct MmClientState {
     u32 server_addr = 0;
     u16 server_udp_port = 0;
     bool matching2_enabled = false;
+    // Contexts the game has started. The server forgets them when the connection drops, so a
+    // reconnect starts them again (guarded by mutex).
+    std::vector<OrbisNpMatching2ContextId> started_ctxs;
 
     std::mutex pending_mutex;
     std::map<u64, PendingRequest> pending;
@@ -873,6 +876,30 @@ void SetMmShadNetClient(std::shared_ptr<ShadNet::ShadNetClient> client,
     }
     client->onRoomEvent = [](const ShadNet::NotifyRoomEvent& n) { HandleRoomEvent(n); };
     client->onRoomMessage = [](const ShadNet::NotifyRoomMessage& n) { HandleRoomMessage(n); };
+
+    // After a reconnect the server has a fresh session that knows none of the game's started
+    // contexts. Start them again quietly (the game already had its STARTED event; the reply has
+    // no pending entry and is dropped).
+    std::vector<OrbisNpMatching2ContextId> restart;
+    {
+        std::lock_guard lock(g_mm.mutex);
+        restart = g_mm.started_ctxs;
+    }
+    for (const auto ctx_id : restart) {
+        auto ctx = NpHandler::GetInstance().GetMatching2ContextManager().Get(ctx_id);
+        if (!ctx) {
+            // Destroyed (or matching2 terminated) without a ContextStop.
+            std::lock_guard lock(g_mm.mutex);
+            std::erase(g_mm.started_ctxs, ctx_id);
+            continue;
+        }
+        shadnet::ContextStartRequest req;
+        req.set_ctx_id(ctx_id);
+        client->SubmitRequest(static_cast<ShadNet::CommandType>(MmCommand::ContextStart),
+                              MakeProtoPayload(req));
+        SendMatching2StunPing(*ctx);
+        LOG_INFO(Lib_NpMatching2, "restarted ctx={} on the new shadNet session", ctx_id);
+    }
 }
 
 void ClearMmShadNetClient() {
@@ -907,6 +934,13 @@ bool IsMmClientRunning() {
 }
 
 void MmContextStart(OrbisNpMatching2ContextId ctx_id) {
+    {
+        std::lock_guard lock(g_mm.mutex);
+        if (std::find(g_mm.started_ctxs.begin(), g_mm.started_ctxs.end(), ctx_id) ==
+            g_mm.started_ctxs.end()) {
+            g_mm.started_ctxs.push_back(ctx_id);
+        }
+    }
     shadnet::ContextStartRequest req;
     req.set_ctx_id(ctx_id);
     MmSubmitRequest(ctx_id, 0, ORBIS_NP_MATCHING2_CONTEXT_EVENT_STARTED, MmCommand::ContextStart,
@@ -917,6 +951,10 @@ void MmContextStart(OrbisNpMatching2ContextId ctx_id) {
 }
 
 s32 MmContextStop(OrbisNpMatching2ContextId ctx_id) {
+    {
+        std::lock_guard lock(g_mm.mutex);
+        std::erase(g_mm.started_ctxs, ctx_id);
+    }
     shadnet::ContextStopRequest req;
     req.set_ctx_id(ctx_id);
     return MmSubmitRequest(ctx_id, 0, ORBIS_NP_MATCHING2_CONTEXT_EVENT_STOPPED,

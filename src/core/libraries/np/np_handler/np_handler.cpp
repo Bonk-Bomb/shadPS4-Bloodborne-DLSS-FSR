@@ -209,9 +209,13 @@ void NpHandler::Shutdown() {
     m_worker_running = false;
 
     // Stop any pending reconnect retries.
+    std::vector<s32> in_grace;
     {
         std::lock_guard lock(m_mutex_clients);
         m_reconnect.clear();
+        for (const auto& [uid, _] : m_grace_until)
+            in_grace.push_back(uid);
+        m_grace_until.clear();
     }
 
     // Collect user IDs to disconnect (avoid holding m_mutex_clients during Stop)
@@ -223,6 +227,9 @@ void NpHandler::Shutdown() {
     }
     for (s32 uid : ids)
         DisconnectUser(uid);
+    // Users still hidden behind a network drop have no client left to stop; just report them.
+    for (s32 uid : in_grace)
+        FireStateCallback(uid, NpManager::OrbisNpState::SignedOut);
 
     if (m_worker_thread.joinable())
         m_worker_thread.join();
@@ -327,14 +334,27 @@ bool NpHandler::ConnectUser(s32 user_id, const std::string& host, u16 port, cons
     NpMatching2::SetMmShadNetClient(client, host, port);
 
     // Build OrbisNpId
+    bool resumed = false;
     {
         OrbisNpId np_id{};
         SetNpId(np_id, npid);
+        CachedIdentity identity{static_cast<OrbisNpAccountId>(client->GetUserId()),
+                                client->GetAvatarUrl(), client->GetBearerToken(),
+                                client->GetAddrLocal()};
         std::lock_guard lock(m_mutex_clients);
         m_np_ids[user_id] = np_id;
+        m_identity[user_id] = std::move(identity);
         m_clients[user_id] = std::move(client);
+        // Back before the game was told about the drop: it never saw a sign-out, so it gets no
+        // sign-in either.
+        resumed = m_grace_until.erase(user_id) > 0;
     }
 
+    if (resumed) {
+        LOG_INFO(NpHandler, "user_id={} back on shadNet before the game noticed the drop",
+                 user_id);
+        return true;
+    }
     FireStateCallback(user_id, NpManager::OrbisNpState::SignedIn);
     return true;
 }
@@ -420,15 +440,72 @@ void NpHandler::DisconnectUser(s32 user_id) {
     LOG_INFO(NpHandler, "user_id={} disconnected", user_id);
 }
 
+void NpHandler::SoftDisconnectUser(s32 user_id) {
+    std::shared_ptr<ShadNet::ShadNetClient> client;
+    {
+        std::lock_guard lock(m_mutex_clients);
+        auto it = m_clients.find(user_id);
+        if (it == m_clients.end())
+            return;
+        client = std::move(it->second);
+        m_clients.erase(it);
+        m_grace_until[user_id] = std::chrono::steady_clock::now() + kDropGracePeriod;
+    }
+    {
+        std::lock_guard lock(m_mutex_friend_state);
+        m_friend_state.erase(user_id); // re-seeded by the next LoginReply
+    }
+    client->Stop();
+    // Requests already sent on the dead connection will never get a reply. Fail them as an
+    // ordinary aborted request; the game retries or skips them like any other failed call.
+    FailPendingRequests(user_id, ORBIS_NP_COMMUNITY_ERROR_ABORTED);
+    LOG_WARNING(NpHandler,
+                "user_id={} lost the shadNet connection; reconnecting in the background, the game "
+                "stays signed in for up to {}s",
+                user_id, kDropGracePeriod.count());
+}
+
+void NpHandler::ExpireGracePeriods() {
+    std::vector<s32> expired;
+    {
+        std::lock_guard lock(m_mutex_clients);
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = m_grace_until.begin(); it != m_grace_until.end();) {
+            if (!m_clients.count(it->first) && now >= it->second) {
+                expired.push_back(it->first);
+                it = m_grace_until.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (s32 uid : expired) {
+        LOG_WARNING(NpHandler,
+                    "user_id={} still offline {}s after the drop; reporting SignedOut to the game "
+                    "(reconnect attempts continue)",
+                    uid, kDropGracePeriod.count());
+        FailPendingRequests(uid, ORBIS_NP_ERROR_SIGNED_OUT);
+        FireStateCallback(uid, NpManager::OrbisNpState::SignedOut);
+    }
+}
+
 void NpHandler::OnUserLoggedIn(s32 user_id) {
     if (ConnectUserById(user_id))
         StartWorker();
 }
 
 void NpHandler::OnUserLoggedOut(s32 user_id) {
+    bool was_in_grace = false;
     {
         std::lock_guard lock(m_mutex_clients);
         m_reconnect.erase(user_id); // do not auto-reconnect
+        was_in_grace = m_grace_until.erase(user_id) > 0;
+    }
+    if (was_in_grace) {
+        // No client to stop; the game still believes this user is signed in.
+        FailPendingRequests(user_id, ORBIS_NP_ERROR_SIGNED_OUT);
+        FireStateCallback(user_id, NpManager::OrbisNpState::SignedOut);
+        return;
     }
     DisconnectUser(user_id);
 }
@@ -450,11 +527,16 @@ void NpHandler::WorkerThread() {
         }
 
         for (s32 uid : dropped) {
-            LOG_WARNING(NpHandler, "user_id={} connection dropped (network); will retry", uid);
-            DisconnectUser(uid);   // reports SignedOut + stops/removes the dead client
-            MarkForReconnect(uid); // schedule transparent reconnect (network drop, not logout)
+            if (!EmulatorSettings.IsShadNetEnabled()) {
+                // Online switched off: nothing will reconnect, so report it straight away.
+                DisconnectUser(uid);
+                continue;
+            }
+            SoftDisconnectUser(uid); // stops/removes the dead client, game stays signed in
+            MarkForReconnect(uid);   // schedule transparent reconnect (network drop, not logout)
         }
 
+        ExpireGracePeriods();
         TryReconnect();
     }
 }
@@ -462,7 +544,7 @@ void NpHandler::WorkerThread() {
 void NpHandler::MarkForReconnect(s32 user_id) {
     if (!EmulatorSettings.IsShadNetEnabled())
         return; // offline mode: nothing to reconnect to
-    constexpr auto kInitialBackoff = std::chrono::milliseconds(2000);
+    constexpr auto kInitialBackoff = std::chrono::milliseconds(500);
     std::lock_guard lock(m_mutex_clients);
     auto& st = m_reconnect[user_id];
     st.backoff = kInitialBackoff;
@@ -505,18 +587,16 @@ void NpHandler::TryReconnect() {
     }
 }
 
+// A client is only added to m_clients after it authenticated, so a client that is present but
+// just lost its socket still counts: the worker is about to move it into the grace period.
 bool NpHandler::IsPsnSignedIn(s32 user_id) const {
     std::lock_guard lock(m_mutex_clients);
-    auto it = m_clients.find(user_id);
-    return it != m_clients.end() && it->second->IsAuthenticated();
+    return m_clients.count(user_id) != 0 || m_grace_until.count(user_id) != 0;
 }
 
 bool NpHandler::IsAnySignedIn() const {
     std::lock_guard lock(m_mutex_clients);
-    for (auto& [_, client] : m_clients)
-        if (client->IsAuthenticated())
-            return true;
-    return false;
+    return !m_clients.empty() || !m_grace_until.empty();
 }
 
 OrbisNpId NpHandler::GetNpId(s32 user_id) const {
@@ -529,28 +609,46 @@ OrbisNpOnlineId NpHandler::GetOnlineId(s32 user_id) const {
     return GetNpId(user_id).handle;
 }
 
+// The getters below fall back to the last login's values while a user is in the grace period,
+// so the game keeps seeing the same identity across a hidden reconnect.
 std::string NpHandler::GetAvatarUrl(s32 user_id) const {
     std::lock_guard lock(m_mutex_clients);
-    auto it = m_clients.find(user_id);
-    return it != m_clients.end() ? it->second->GetAvatarUrl() : std::string{};
+    if (auto it = m_clients.find(user_id); it != m_clients.end())
+        return it->second->GetAvatarUrl();
+    if (m_grace_until.count(user_id))
+        if (auto id = m_identity.find(user_id); id != m_identity.end())
+            return id->second.avatar_url;
+    return {};
 }
 
 OrbisNpAccountId NpHandler::GetAccountId(s32 user_id) const {
     std::lock_guard lock(m_mutex_clients);
-    auto it = m_clients.find(user_id);
-    return it != m_clients.end() ? static_cast<OrbisNpAccountId>(it->second->GetUserId()) : 0;
+    if (auto it = m_clients.find(user_id); it != m_clients.end())
+        return static_cast<OrbisNpAccountId>(it->second->GetUserId());
+    if (m_grace_until.count(user_id))
+        if (auto id = m_identity.find(user_id); id != m_identity.end())
+            return id->second.account_id;
+    return 0;
 }
 
 std::string NpHandler::GetBearerToken(s32 user_id) const {
     std::lock_guard lock(m_mutex_clients);
-    auto it = m_clients.find(user_id);
-    return it != m_clients.end() ? it->second->GetBearerToken() : std::string{};
+    if (auto it = m_clients.find(user_id); it != m_clients.end())
+        return it->second->GetBearerToken();
+    if (m_grace_until.count(user_id))
+        if (auto id = m_identity.find(user_id); id != m_identity.end())
+            return id->second.bearer_token;
+    return {};
 }
 
 u32 NpHandler::GetLocalIpAddr(s32 user_id) const {
     std::lock_guard lock(m_mutex_clients);
-    auto it = m_clients.find(user_id);
-    return it != m_clients.end() ? it->second->GetAddrLocal() : 0;
+    if (auto it = m_clients.find(user_id); it != m_clients.end())
+        return it->second->GetAddrLocal();
+    if (m_grace_until.count(user_id))
+        if (auto id = m_identity.find(user_id); id != m_identity.end())
+            return id->second.local_ip;
+    return 0;
 }
 
 s32 NpHandler::GetUserIdByAccountId(u64 account_id) const {
