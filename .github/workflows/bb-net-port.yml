@@ -33,6 +33,19 @@ jobs:
         append-timestamp: false
         key: bb-net-${{ runner.os }}-${{ hashFiles('**/CMakeLists.txt', 'cmake/**') }}
 
+    # DLSS frame generation is compiled in only with the Streamline SDK headers (README: 2.14.1,
+    # matching the sl.*.dll files the release ships). Without them the build silently falls back
+    # to FSR frame generation.
+    - name: Streamline SDK headers
+      shell: bash
+      run: |
+        git clone -q --depth 1 --branch v2.14.1 --filter=blob:none --sparse \
+          https://github.com/NVIDIA-RTX/Streamline.git "$RUNNER_TEMP/streamline"
+        git -C "$RUNNER_TEMP/streamline" sparse-checkout set include
+        test -f "$RUNNER_TEMP/streamline/include/sl.h"
+        test -f "$RUNNER_TEMP/streamline/include/sl_dlss_g.h"
+        echo "STREAMLINE_DIR=$(cygpath -m "$RUNNER_TEMP/streamline")" >> "$GITHUB_ENV"
+
     - name: Configure
       id: configure
       continue-on-error: true
@@ -41,6 +54,7 @@ jobs:
         set -o pipefail
         mkdir -p ci-logs
         cmake --fresh -G Ninja -B build -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
+          -DBB_STREAMLINE_DIR="$STREAMLINE_DIR" \
           -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON \
           -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl \
           -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache 2>&1 | tee ci-logs/configure.log
@@ -53,6 +67,8 @@ jobs:
       run: |
         set -o pipefail
         cmake --build build --config $BUILD_TYPE --parallel $NUMBER_OF_PROCESSORS -- -k 0 2>&1 | tee ci-logs/build.log
+        # Refuse to publish an exe without DLSS frame generation.
+        grep -a -q "sl.interposer.dll" build/shadPS4.exe || { echo "DLSS frame generation missing from the exe"; exit 1; }
 
     - name: Collect errors
       if: always()
