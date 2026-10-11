@@ -36,6 +36,7 @@
 #include "core/emulator_state.h"
 #include "core/file_format/psf.h"
 #include "core/file_format/trp.h"
+#include "core/file_sys/bb_hdr_compat.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/libs.h"
@@ -48,6 +49,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
 #include "video_core/renderer_vulkan/vk_dlss_ngx.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -727,6 +729,15 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     // Initialize kernel and library facilities.
     Libraries::InitHLELibs(&linker->GetHLESymbols());
+
+    FileSys::BbHdrCompat::Initialize(IsBloodborne(id) && app_version == "01.09" &&
+                                         EmulatorSettings.IsHdrAllowed(),
+                                     Vulkan::BbDlssSettingsPath());
+    if (FileSys::BbHdrCompat::IsCandidate(
+            "dvdroot_ps4/param/drawparam/m21_00_0000.gparambnd.dcx")) {
+        // Recognize the remaster before executable patches can disable RenoDX's shader passes.
+        mnt->Open("/app0/dvdroot_ps4/param/drawparam/m21_00_0000.gparambnd.dcx", false);
+    }
 
     // Load the module with the linker.
     if (linker->LoadModule(guest_eboot_path) == -1) {

@@ -13,6 +13,7 @@
 #include "common/path_util.h"
 #include "core/emulator_state.h"
 #include "core/file_format/psf.h"
+#include "core/file_sys/bb_hdr_compat.h"
 #include "memory_patcher.h"
 
 namespace MemoryPatcher {
@@ -298,6 +299,10 @@ void ApplyPendingPatches() {
 }
 
 void PatchMemory(const patchInfo& patch) {
+    if (Core::FileSys::BbHdrCompat::ShouldSkipPatch(patch.modNameStr)) {
+        LOG_INFO(Loader, "[HDR-COMPAT] Skipped conflicting patch: {}", patch.modNameStr);
+        return;
+    }
     // Send a request to modify the process memory.
     void* cheatAddress = nullptr;
 

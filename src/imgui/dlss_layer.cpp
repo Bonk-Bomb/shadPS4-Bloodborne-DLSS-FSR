@@ -16,6 +16,7 @@
 
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
+#include "core/file_sys/bb_hdr_compat.h"
 #include "imgui/dlss_layer.h"
 #include "imgui/imgui_layer.h"
 #include "imgui/renderer/imgui_core.h"
@@ -73,7 +74,7 @@ constexpr char MotionBlurPatch[] = "Disable Motion Blur[^\"]*";
 // With RenoDX HDR, Disable AA turns skin blue: its HDR output expects what the game's AA pass
 // leaves in the image.
 bool Wanted(size_t i) {
-    return !(Vulkan::RenoDxLoaded() && std::string_view{RecommendedPatches[i]} == "Disable AA");
+    return !(Vulkan::RenoDxLoaded() && i < 2);
 }
 
 std::filesystem::path PatchFile() {
@@ -266,7 +267,8 @@ void DlssLayer::Draw() {
         PopStyleColor();
     }
 
-    if (!Wanted(0) && patches.enabled[0]) {
+    if (!Wanted(0) && patches.enabled[0] &&
+        !::Core::FileSys::BbHdrCompat::ShouldSkipPatch(RecommendedPatches[0])) {
         PushStyleColor(ImGuiCol_Text, ImVec4{1.0f, 0.4f, 0.4f, 1.0f});
         TextWrapped("The Disable AA patch is on. With RenoDX HDR it makes skin look blue: turn it "
                     "off below and restart the game.");
@@ -311,6 +313,17 @@ void DlssLayer::Draw() {
     float sharpness = float(std::atof(settings.Get("sharpness", "0.6").c_str()));
     if (SliderFloat("Sharpness", &sharpness, 0.0f, 1.0f, "%.2f"))
         settings.Set("sharpness", fmt::format("{:.2f}", sharpness));
+
+    if (Vulkan::RenoDxLoaded()) {
+        bool hdr_compat = settings.Get("hdr_mod_compat", "1") != "0";
+        if (Checkbox("Remaster HDR compatibility (restart)", &hdr_compat))
+            settings.Set("hdr_mod_compat", hdr_compat ? "1" : "0");
+        BeginDisabled(!hdr_compat);
+        bool moon_restore = settings.Get("hdr_moon_restore", "0") == "1";
+        if (Checkbox("Restore original moon lighting (restart)", &moon_restore))
+            settings.Set("hdr_moon_restore", moon_restore ? "1" : "0");
+        EndDisabled();
+    }
 
     bool frame_gen = settings.Get("frame_gen", "0") != "0";
     if (Checkbox("Frame generation", &frame_gen))
@@ -416,11 +429,17 @@ void DlssLayer::Draw() {
     } else {
         bool all = true;
         for (size_t i = 0; i < RecommendedPatches.size(); ++i) {
-            const bool good = patches.enabled[i] == Wanted(i);
+            const bool skipped =
+                patches.enabled[i] &&
+                ::Core::FileSys::BbHdrCompat::ShouldSkipPatch(RecommendedPatches[i]);
+            const bool good = (patches.enabled[i] && !skipped) == Wanted(i);
             all &= good;
             TextColored(good ? ImVec4{0.4f, 1.0f, 0.4f, 1.0f} : ImVec4{1.0f, 0.75f, 0.3f, 1.0f},
-                        "%s  %s%s", patches.enabled[i] ? "on " : "off", RecommendedPatches[i],
-                        Wanted(i) ? "" : " (must be off with RenoDX HDR)");
+                        "%s  %s%s", patches.enabled[i] && !skipped ? "on " : "off",
+                        RecommendedPatches[i],
+                        skipped     ? " (ignored for HDR)"
+                        : Wanted(i) ? ""
+                                    : " (must be off with RenoDX HDR)");
         }
         if (patches.motion_blur_disabled) {
             all = false;

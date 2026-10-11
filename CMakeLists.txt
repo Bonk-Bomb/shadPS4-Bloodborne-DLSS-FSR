@@ -899,6 +899,9 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/file_format/npbind.h
          src/core/file_sys/fs.cpp
          src/core/file_sys/fs.h
+         src/core/file_sys/bb_hdr_compat.cpp
+         src/core/file_sys/bb_hdr_compat.h
+         src/core/file_sys/bb_hdr_profiles.h
          src/core/file_sys/ifile.cpp
          src/core/file_sys/ifile.h
          src/core/file_sys/backends/host_fs.cpp
@@ -1401,7 +1404,7 @@ elseif (${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
 endif()
 
 if (WIN32)
-    target_link_libraries(shadps4 PRIVATE mincore wepoll wbemuuid)
+    target_link_libraries(shadps4 PRIVATE mincore wepoll wbemuuid bcrypt)
 
     if (MSVC)
         # MSVC likes putting opinions on what people can use, disable:

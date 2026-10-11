@@ -8,9 +8,11 @@
 #include "common/string_util.h"
 #include "core/file_sys/backends/host_fs.h"
 #include "core/file_sys/backends/zarchive_fs.h"
+#include "core/file_sys/bb_hdr_compat.h"
 #include "core/file_sys/devices/logger.h"
 #include "core/file_sys/devices/nop_device.h"
 #include "core/file_sys/fs.h"
+#include "video_core/renderer_vulkan/vk_hdr_mod.h"
 
 namespace Core::FileSys {
 
@@ -481,7 +483,13 @@ std::unique_ptr<IFile> MntPoints::Open(std::string_view guest_path,
 
     for (const auto& backend : mount->backends) {
         if (backend->Exists(rel) && !backend->IsDirectory(rel)) {
-            return backend->Open(rel_copy, mode);
+            auto file = backend->Open(rel_copy, mode);
+            if (mode == Common::FS::FileAccessMode::Read &&
+                (mount->mount == "/app0" || mount->mount == "/hostapp") &&
+                BbHdrCompat::IsCandidate(rel) && Vulkan::RenoDxLoaded()) {
+                file = BbHdrCompat::Open(std::move(file), rel);
+            }
+            return file;
         }
     }
     return nullptr;

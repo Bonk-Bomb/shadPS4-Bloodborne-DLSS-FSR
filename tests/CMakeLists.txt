@@ -344,3 +344,16 @@ gtest_discover_tests(shadps4_http_test
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     DISCOVERY_TIMEOUT 60
 )
+
+add_executable(shadps4_bb_hdr_compat_test
+    ${CMAKE_SOURCE_DIR}/src/core/file_sys/bb_hdr_compat.cpp
+    test_bb_hdr_compat.cpp
+)
+target_include_directories(shadps4_bb_hdr_compat_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_bb_hdr_compat_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_bb_hdr_compat_test PRIVATE GTest::gtest_main fmt::fmt ZLIB::ZLIB)
+if (WIN32)
+    target_link_libraries(shadps4_bb_hdr_compat_test PRIVATE bcrypt)
+    target_compile_definitions(shadps4_bb_hdr_compat_test PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
+endif()
+gtest_discover_tests(shadps4_bb_hdr_compat_test)

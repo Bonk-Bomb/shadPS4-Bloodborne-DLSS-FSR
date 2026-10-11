@@ -197,7 +197,14 @@ enjoy it, donate to the RenoDX devs, they deserve it.
 Use 1.8.2 or newer. In 1.8.0 and 1.8.1, upscaling with a regular Resolution Patch capped
 highlights at about 200 nits; 1.7.0 and earlier didn't support RenoDX.
 
-- Turn the **Disable AA** patch off: with RenoDX it turns skin blue. F1 warns about it.
+1.8.5 restores RenoDX's Game/UI Brightness and Bloom controls with BB PC Remaster 1.01 + 1.07.
+Recognized remaster files are corrected in memory, whether installed as a mod overlay or merged
+into the game. No game files are changed; SDR and unmodded rendering are left alone.
+
+- Turn the **Disable AA** patch off: with RenoDX it turns skin blue. With the recognized remaster,
+  1.8.5 automatically ignores **Disable AA**, **Disable Bloom** and **Disable Chromatic Aberration**
+  for HDR, so RenoDX can control those passes.
+- **Restore original moon lighting** in F1 is optional and off by default. Restart after changing it.
 - Frame generation always uses FSR with RenoDX.
 - G-SYNC/FreeSync screens can flicker in HDR with frame generation off.
 
