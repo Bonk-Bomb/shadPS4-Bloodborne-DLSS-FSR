@@ -1248,7 +1248,9 @@ set(IMGUI src/imgui/imgui_config.h
           src/imgui/big_picture/imgui_impl_sdlrenderer3.h
 )
 
-set(INPUT src/input/controller.cpp
+set(INPUT src/input/bb_autopilot.cpp
+          src/input/bb_autopilot.h
+          src/input/controller.cpp
           src/input/controller.h
           src/input/controller_state.cpp
           src/input/input_handler.cpp

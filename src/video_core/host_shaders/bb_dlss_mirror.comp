@@ -1,0 +1,31 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Diagnostic: copies an image mirrored horizontally and/or vertically, scaling each channel
+// (motion vectors change sign along a mirrored axis).
+#version 460
+layout(local_size_x=8, local_size_y=8) in;
+layout(binding=0) uniform sampler2D source;
+#if defined(OUT_R32F)
+layout(binding=1, r32f) uniform writeonly image2D result;
+#elif defined(OUT_RG16F)
+layout(binding=1, rg16f) uniform writeonly image2D result;
+#else
+layout(binding=1, rgba16f) uniform writeonly image2D result;
+#endif
+layout(push_constant) uniform Push {
+    vec4 scale;
+    uint flip; // 1: mirror x, 2: mirror y
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(result);
+    if (any(greaterThanEqual(p, size)))
+        return;
+    ivec2 s = p;
+    if ((pc.flip & 1u) != 0)
+        s.x = size.x - 1 - p.x;
+    if ((pc.flip & 2u) != 0)
+        s.y = size.y - 1 - p.y;
+    imageStore(result, p, texelFetch(source, s, 0) * pc.scale);
+}

@@ -1,0 +1,62 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Diagnostic: how much the upscaled image changes from the previous frame once motion is taken
+// out, summed per 64x64 cell. Per cell: |change along motion|, |detail| (pixel against its four
+// neighbours), |change at the same pixel|, pixel count, |motion| (all x4096 except count).
+#version 460
+layout(local_size_x=8, local_size_y=8) in;
+layout(binding=0) uniform sampler2D current;
+layout(binding=1) uniform sampler2D previous; // last frame's upscaled image (linear sampler)
+layout(binding=2) uniform sampler2D motion;   // render-size, current -> previous, render pixels
+layout(binding=3, std430) buffer Grid { uint cells[]; };
+layout(push_constant) uniform Push {
+    vec2 mv_scale; // render pixels -> output pixels
+    uint grid_w;
+    uint grid_h;
+    uint have_previous;
+} pc;
+
+shared uint s_diff, s_detail, s_still, s_count, s_motion;
+
+const vec3 Luma = vec3(0.2126, 0.7152, 0.0722);
+
+float Lum(ivec2 p, ivec2 size) {
+    return dot(clamp(texelFetch(current, clamp(p, ivec2(0), size - 1), 0).rgb, 0, 1), Luma);
+}
+
+void main() {
+    if (gl_LocalInvocationIndex == 0) {
+        s_diff = 0; s_detail = 0; s_still = 0; s_count = 0; s_motion = 0;
+    }
+    barrier();
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = textureSize(current, 0);
+    if (all(lessThan(p, size)) && pc.have_previous != 0) {
+        vec2 uv = (vec2(p) + 0.5) / vec2(size);
+        vec2 mv = texture(motion, uv).rg * pc.mv_scale;
+        vec2 q = vec2(p) + 0.5 + mv;
+        if (all(greaterThanEqual(q, vec2(0))) && all(lessThan(q, vec2(size))) &&
+            !any(isnan(mv))) {
+            float l = Lum(p, size);
+            float lp = dot(clamp(texture(previous, q / vec2(size)).rgb, 0, 1), Luma);
+            float ls = dot(clamp(texelFetch(previous, p, 0).rgb, 0, 1), Luma);
+            float n = 0.25 * (Lum(p + ivec2(1, 0), size) + Lum(p - ivec2(1, 0), size) +
+                              Lum(p + ivec2(0, 1), size) + Lum(p - ivec2(0, 1), size));
+            atomicAdd(s_diff, uint(abs(l - lp) * 4096.0 + 0.5));
+            atomicAdd(s_detail, uint(abs(l - n) * 4096.0 + 0.5));
+            atomicAdd(s_still, uint(abs(l - ls) * 4096.0 + 0.5));
+            atomicAdd(s_motion, uint(min(length(mv), 64.0) * 64.0 + 0.5));
+            atomicAdd(s_count, 1u);
+        }
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0 && s_count != 0) {
+        uvec2 cell = min(gl_WorkGroupID.xy / 8u, uvec2(pc.grid_w - 1, pc.grid_h - 1));
+        uint i = (cell.y * pc.grid_w + cell.x) * 5u;
+        atomicAdd(cells[i + 0], s_diff);
+        atomicAdd(cells[i + 1], s_detail);
+        atomicAdd(cells[i + 2], s_still);
+        atomicAdd(cells[i + 3], s_count);
+        atomicAdd(cells[i + 4], s_motion);
+    }
+}
