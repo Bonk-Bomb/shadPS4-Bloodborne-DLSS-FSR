@@ -12,8 +12,10 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 #include <fmt/format.h>
 #include "common/logging/log.h"
 #include "common/path_util.h"
@@ -311,6 +313,11 @@ struct Tune {
     bool motion_blur = false;
     bool menu_fix = true;
     bool auto_exposure = true; // HDR input (decoupled UI): FSR computes the exposure
+    // Diagnostic: changing dump to a new non-zero number writes the upscaler's inputs (and
+    // with dump_output=1 its output) for the next dump_frames frames into shadPS4\dlss_dump.
+    int dump = 0;
+    u32 dump_frames = 10;
+    bool dump_output = true;
 };
 
 enum class Backend { None, Dlss, Fsr, Fsr4 };
@@ -410,6 +417,11 @@ struct BbTemporalDlss::Impl {
     std::unique_ptr<Fsr4Addon> fsr4;
     std::optional<Fsr4Addon::ContextDesc> fsr4_rejected_size;
     bool fsr_tried{}, fsr4_tried{}, camera_logged{};
+    // Diagnostic dump state (see Tune::dump) and the motion pass constants of this frame.
+    bool tune_loaded{};
+    u32 dump_left{}, dump_index{};
+    std::array<float, 22> motion_constants{};
+    u32 motion_flags{};
 
     Impl() {
         requested = BbTemporalDlssRequested();
@@ -483,6 +495,12 @@ struct BbTemporalDlss::Impl {
                 next.menu_fix = number != 0;
             else if (key == "motion_blur")
                 next.motion_blur = number != 0;
+            else if (key == "dump")
+                next.dump = number;
+            else if (key == "dump_frames")
+                next.dump_frames = u32(std::clamp(number, 1, 60));
+            else if (key == "dump_output")
+                next.dump_output = number != 0;
             else if (key == "upscaler")
                 next.upscaler = value.starts_with("dlss")   ? 1
                                 : value.starts_with("fsr4") ? 3
@@ -497,6 +515,14 @@ struct BbTemporalDlss::Impl {
                                   : vk::Extent2D{};
             }
         }
+        // A dump starts when the number changes after launch, never from the file as found.
+        if (tune_loaded && next.dump != tune.dump && next.dump != 0) {
+            dump_left = next.dump_frames;
+            dump_index = 0;
+            LOG_INFO(Render_Vulkan, "[DLSS-DUMP] Capturing {} frames as dump {}", dump_left,
+                     next.dump);
+        }
+        tune_loaded = true;
         tune = next;
         FrameGen::SetEnabled(tune.frame_gen);
         FrameGen::SetCounterVisible(tune.fps_counter);
@@ -829,6 +855,147 @@ struct BbTemporalDlss::Impl {
         frame_gen_pending = inputs;
     }
 
+    static u32 DumpBytesPerPixel(vk::Format format) {
+        return format == vk::Format::eR16G16B16A16Sfloat ? 8 : 4; // RGBA8, R32, RG16 otherwise
+    }
+
+    // Diagnostic: copies this frame's upscaler inputs (and output) into host memory and writes
+    // them to files once the GPU has finished with them, without stalling the frame.
+    void DumpFrame(const Instance& instance, Runtime& runtime, Scheduler& scheduler,
+                   vk::CommandBuffer command, VideoCore::Image& depth, vk::Extent2D in,
+                   vk::Extent2D out, const DlssNgx::EvalDesc& eval,
+                   const std::array<float, 2>& applied, bool linear) {
+        struct Part {
+            std::string name;
+            vk::Image image;
+            vk::Extent2D extent;
+            vk::Format format;
+            u64 offset, bytes;
+        };
+        std::vector<Part> parts;
+        u64 total = 0;
+        const auto add = [&](const char* name, vk::Image image, vk::Extent2D extent,
+                             vk::Format format) {
+            const u64 bytes = u64(extent.width) * extent.height * DumpBytesPerPixel(format);
+            parts.push_back(Part{name, image, extent, format, total, bytes});
+            total += (bytes + 255) & ~u64(255);
+        };
+        const bool depth_copyable =
+            bool(depth.backing->image.image_ci.usage & vk::ImageUsageFlagBits::eTransferSrc);
+        add("color", snapshot->image.image, in, snapshot->format);
+        if (depth_copyable)
+            add("depth", depth.GetImage(), in, vk::Format::eR32Sfloat);
+        add("motion", motion->image.image, in, motion->format);
+        OwnedImage* const output_image = tune.dump_output ? upscaled.get() : nullptr;
+        if (output_image)
+            add("output", output_image->image.image, output_image->extent, output_image->format);
+
+        auto buffer = std::make_shared<VideoCore::Buffer>(
+            instance, 0, total, VideoCore::MemoryType::HostCached, "DLSS dump");
+        if (buffer->mapped_data.size() < total)
+            throw std::runtime_error("dump buffer is not host visible");
+
+        if (depth_copyable) {
+            runtime.Transit(&depth, vk::ImageLayout::eTransferSrcOptimal,
+                            vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
+            runtime.FlushBarriers();
+        }
+        std::vector<std::pair<OwnedImage*, vk::ImageLayout>> restore;
+        for (auto* owned : {snapshot.get(), motion.get(), output_image}) {
+            if (!owned)
+                continue;
+            restore.emplace_back(owned, owned->layout);
+            owned->Transit(command, vk::ImageLayout::eTransferSrcOptimal,
+                           vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
+        }
+        for (const auto& part : parts) {
+            const vk::BufferImageCopy region{
+                .bufferOffset = part.offset,
+                .imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                     .layerCount = 1},
+                .imageExtent = {part.extent.width, part.extent.height, 1}};
+            command.copyImageToBuffer(part.image, vk::ImageLayout::eTransferSrcOptimal,
+                                      buffer->Handle(), region);
+        }
+        const vk::BufferMemoryBarrier2 to_host{
+            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = buffer->Handle(),
+            .offset = 0,
+            .size = VK_WHOLE_SIZE};
+        command.pipelineBarrier2(
+            vk::DependencyInfo{.bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &to_host});
+        for (auto& [owned, layout] : restore)
+            if (layout != vk::ImageLayout::eUndefined && layout != owned->layout)
+                owned->Transit(command, layout, vk::PipelineStageFlagBits2::eAllCommands,
+                               vk::AccessFlagBits2::eMemoryRead);
+
+        // Everything needed to redo the motion pass and judge the frame offline.
+        const auto join = [](const auto& values) {
+            std::string text;
+            for (const auto value : values)
+                text += fmt::format("{}{:.9g}", text.empty() ? "" : " ", double(value));
+            return text;
+        };
+        std::string meta = fmt::format(
+            "dump={} index={} frame={} evaluation={} backend={}\n"
+            "render={}x{} output={}x{} color_format={} upscaler_input_linear={}\n"
+            "jitter_applied_render_px={:.6f} {:.6f}\njitter_sent={:.6f} {:.6f}\n"
+            "reset={} frame_ms={:.3f} jittered_draws={} jittered_before_copy={}\n"
+            "motion_flags={:#x} (1 snap, 2 scene camera, 0x100 object motion)\n"
+            "tune_jitter={} sign={} {} object_motion={} scene_camera={} camera_snap={} "
+            "preset={} quality={}\n",
+            tune.dump, dump_index, frame, evaluations + 1, BackendName(backend), in.width,
+            in.height, out.width, out.height, vk::to_string(snapshot->format), linear,
+            applied[0], applied[1], eval.jitter_x, eval.jitter_y, eval.reset, frame_ms,
+            jittered_draws, jittered_before_copy, motion_flags, tune.jitter, tune.sign_x,
+            tune.sign_y, tune.mirror, tune.scene_camera, tune.camera_snap, tune.preset,
+            tune.quality);
+        meta += "motion_push(reproject12 proj4 prev_proj4 jitter2)=" + join(motion_constants) + "\n";
+        meta += fmt::format("camera_valid={} previous_valid={}\n", camera.valid,
+                            previous_camera.valid);
+        meta += "camera_view=" + join(camera.view) + "\n";
+        meta += "camera_inv_view=" + join(camera.inv_view) + "\n";
+        meta += "camera_proj=" + join(camera.proj) + "\n";
+        meta += "previous_view=" + join(previous_camera.view) + "\n";
+        meta += "previous_inv_view=" + join(previous_camera.inv_view) + "\n";
+        meta += "previous_proj=" + join(previous_camera.proj) + "\n";
+        const auto stem = fmt::format("d{}_f{:02}", tune.dump, dump_index);
+        for (const auto& part : parts) {
+            const auto file = fmt::format("{}_{}_{}x{}_{}.bin", stem, part.name, part.extent.width,
+                                          part.extent.height, vk::to_string(part.format));
+            meta += fmt::format("file {} {} {} {} {}\n", part.name, file, part.extent.width,
+                                part.extent.height, vk::to_string(part.format));
+        }
+        const auto dir = BbDlssSettingsPath().parent_path() / "dlss_dump";
+        scheduler.DeferOperation([buffer, parts, meta, dir, stem, total] {
+            buffer->Invalidate(0, total);
+            auto data = std::make_shared<std::vector<u8>>(buffer->mapped_data.begin(),
+                                                          buffer->mapped_data.begin() + total);
+            std::thread([data, parts, meta, dir, stem] {
+                std::error_code error;
+                std::filesystem::create_directories(dir, error);
+                for (const auto& part : parts) {
+                    std::ofstream file{dir / fmt::format("{}_{}_{}x{}_{}.bin", stem, part.name,
+                                                         part.extent.width, part.extent.height,
+                                                         vk::to_string(part.format)),
+                                       std::ios::binary};
+                    file.write(reinterpret_cast<const char*>(data->data() + part.offset),
+                               std::streamsize(part.bytes));
+                }
+                std::ofstream{dir / (stem + "_meta.txt")} << meta;
+            }).detach();
+        });
+        ++dump_index;
+        if (--dump_left == 0)
+            LOG_INFO(Render_Vulkan, "[DLSS-DUMP] Dump {} recorded: {} frames into {}", tune.dump,
+                     dump_index, dir.string());
+    }
+
     void InvalidateOutputs() {
         for (auto& [_, image] : outputs)
             image->fresh = false;
@@ -1046,9 +1213,10 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         upscaled->extent != out) {
         scheduler.Finish(); // owned images may still be in flight
         using U = vk::ImageUsageFlagBits;
-        snapshot = std::make_unique<OwnedImage>(instance, color_format, in,
-                                                renodx ? U::eSampled | U::eStorage
-                                                       : U::eSampled | U::eTransferDst);
+        snapshot = std::make_unique<OwnedImage>(
+            instance, color_format, in,
+            (renodx ? U::eSampled | U::eStorage : U::eSampled | U::eTransferDst) |
+                U::eTransferSrc); // transfer source for the diagnostic dump
         motion = std::make_unique<OwnedImage>(instance, vk::Format::eR16G16Sfloat, in,
                                               U::eSampled | U::eStorage | U::eTransferSrc);
         upscaled = std::make_unique<OwnedImage>(instance, vk::Format::eR16G16B16A16Sfloat, out,
@@ -1266,6 +1434,8 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         push.jitter[1] = applied[1];
         push.use_mirror = use_mirror ? 1u : 0u;
         push.flags = (tune.camera_snap ? 1u : 0u) | (scene_camera ? 2u : 0u);
+        std::memcpy(motion_constants.data(), &push, sizeof(motion_constants));
+        motion_flags = push.flags | (push.use_mirror << 8);
         command.bindPipeline(vk::PipelineBindPoint::eCompute, *motion_pass->pipeline);
         command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *motion_pass->layout, 0,
                                      writes);
@@ -1388,6 +1558,15 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         dlss_ready = true;
     }
     CaptureFrameGen(instance, runtime, scheduler, command, *depth, in, eval);
+    if (dump_left > 0) {
+        try {
+            DumpFrame(instance, runtime, scheduler, command, *depth, in, out, eval, applied,
+                      linear);
+        } catch (const std::exception& e) {
+            dump_left = 0;
+            LOG_ERROR(Render_Vulkan, "[DLSS-DUMP] Stopped: {}", e.what());
+        }
+    }
     dlss_pre_hud = pre_hud;
     evaluated_since_copy = true;
     history_valid = true;
