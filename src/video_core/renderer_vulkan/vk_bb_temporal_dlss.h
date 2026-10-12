@@ -95,7 +95,7 @@ public:
     void ObserveTexture(const VideoCore::Image& image, VideoCore::ImageId id,
                         const VideoCore::ImageViewInfo& view, u64 shader_hash, u32 slot);
     // CPU-visible bytes of any read-only constant binding; finds the game's scene constants.
-    void ObserveSceneConstants(const void* data, u64 size);
+    void ObserveSceneConstants(const void* data, u64 size, u64 hash, u32 binding);
     void ObserveConstants(Runtime& runtime, const Instance& instance,
                           const VideoCore::Buffer* source, u64 offset, u64 size, u64 shader_hash,
                           u32 binding);
