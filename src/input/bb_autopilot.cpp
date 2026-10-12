@@ -77,7 +77,7 @@ Pad ButtonByName(const std::string& name) {
     return Pad::None;
 }
 
-void Load() {
+void Load(Clock::time_point now) {
     std::ifstream file{state.path};
     if (!file)
         return;
@@ -143,7 +143,7 @@ void Load() {
     if (!first && run != 0 && run != state.run) {
         state.playing = enabled && !state.steps.empty();
         state.playing_run = run;
-        state.started = Clock::now();
+        state.started = now;
         LOG_INFO(Input, "[AUTOPILOT] Run {}: {} steps x{}", run, state.steps.size(), repeat);
     }
     if (!enabled)
@@ -161,7 +161,7 @@ void Poll(Clock::time_point now) {
     const auto time = std::filesystem::last_write_time(state.path, error);
     if (!error && time != state.file_time) {
         state.file_time = time;
-        Load();
+        Load(now);
     }
     if (state.boot && !state.boot_done) {
         state.gameplay = Vulkan::BbTemporalDlssStatus().active;
@@ -200,8 +200,9 @@ void Apply(Libraries::Pad::OrbisPadData& data) {
     u64 total = 0;
     for (const auto& step : state.steps)
         total += step.ms;
-    const u64 elapsed =
-        std::chrono::duration_cast<std::chrono::milliseconds>(now - state.started).count();
+    // `now` is never earlier than `started` (Load stamps runs with the poll's own time).
+    const u64 elapsed = u64(std::max<s64>(
+        0, std::chrono::duration_cast<std::chrono::milliseconds>(now - state.started).count()));
     if (total == 0 || elapsed >= total * state.repeat) {
         state.playing = false;
         state.status = {state.playing_run, 0, false};
