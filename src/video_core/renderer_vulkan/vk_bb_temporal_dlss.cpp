@@ -420,6 +420,7 @@ struct BbTemporalDlss::Impl {
     // Diagnostic dump state (see Tune::dump) and the motion pass constants of this frame.
     bool tune_loaded{};
     u32 dump_left{}, dump_index{};
+    std::optional<std::string> dump_composite; // file stem for this frame's composite dump
     std::array<float, 22> motion_constants{};
     u32 motion_flags{};
 
@@ -859,55 +860,30 @@ struct BbTemporalDlss::Impl {
         return format == vk::Format::eR16G16B16A16Sfloat ? 8 : 4; // RGBA8, R32, RG16 otherwise
     }
 
-    // Diagnostic: copies this frame's upscaler inputs (and output) into host memory and writes
-    // them to files once the GPU has finished with them, without stalling the frame.
-    void DumpFrame(const Instance& instance, Runtime& runtime, Scheduler& scheduler,
-                   vk::CommandBuffer command, VideoCore::Image& depth, vk::Extent2D in,
-                   vk::Extent2D out, const DlssNgx::EvalDesc& eval,
-                   const std::array<float, 2>& applied, bool linear) {
-        struct Part {
-            std::string name;
-            vk::Image image;
-            vk::Extent2D extent;
-            vk::Format format;
-            u64 offset, bytes;
-        };
-        std::vector<Part> parts;
-        u64 total = 0;
-        const auto add = [&](const char* name, vk::Image image, vk::Extent2D extent,
-                             vk::Format format) {
-            const u64 bytes = u64(extent.width) * extent.height * DumpBytesPerPixel(format);
-            parts.push_back(Part{name, image, extent, format, total, bytes});
-            total += (bytes + 255) & ~u64(255);
-        };
-        const bool depth_copyable =
-            bool(depth.backing->image.image_ci.usage & vk::ImageUsageFlagBits::eTransferSrc);
-        add("color", snapshot->image.image, in, snapshot->format);
-        if (depth_copyable)
-            add("depth", depth.GetImage(), in, vk::Format::eR32Sfloat);
-        add("motion", motion->image.image, in, motion->format);
-        OwnedImage* const output_image = tune.dump_output ? upscaled.get() : nullptr;
-        if (output_image)
-            add("output", output_image->image.image, output_image->extent, output_image->format);
+    struct DumpPart {
+        std::string name;
+        vk::Image image;
+        vk::Extent2D extent;
+        vk::Format format;
+        u64 offset{}, bytes{};
+    };
 
+    // Copies the parts (already in eTransferSrcOptimal) into host memory and, once the GPU has
+    // finished with them, writes <stem>_<name>_<w>x<h>_<format>.bin and <stem>_<meta_name>.txt
+    // from a worker thread, so the frame is not stalled.
+    void WriteDump(const Instance& instance, Scheduler& scheduler, vk::CommandBuffer command,
+                   std::vector<DumpPart> parts, std::string meta, const std::string& stem,
+                   const char* meta_name) {
+        u64 total = 0;
+        for (auto& part : parts) {
+            part.bytes = u64(part.extent.width) * part.extent.height * DumpBytesPerPixel(part.format);
+            part.offset = total;
+            total += (part.bytes + 255) & ~u64(255);
+        }
         auto buffer = std::make_shared<VideoCore::Buffer>(
             instance, 0, total, VideoCore::MemoryType::HostCached, "DLSS dump");
         if (buffer->mapped_data.size() < total)
             throw std::runtime_error("dump buffer is not host visible");
-
-        if (depth_copyable) {
-            runtime.Transit(&depth, vk::ImageLayout::eTransferSrcOptimal,
-                            vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
-            runtime.FlushBarriers();
-        }
-        std::vector<std::pair<OwnedImage*, vk::ImageLayout>> restore;
-        for (auto* owned : {snapshot.get(), motion.get(), output_image}) {
-            if (!owned)
-                continue;
-            restore.emplace_back(owned, owned->layout);
-            owned->Transit(command, vk::ImageLayout::eTransferSrcOptimal,
-                           vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
-        }
         for (const auto& part : parts) {
             const vk::BufferImageCopy region{
                 .bufferOffset = part.offset,
@@ -929,10 +905,63 @@ struct BbTemporalDlss::Impl {
             .size = VK_WHOLE_SIZE};
         command.pipelineBarrier2(
             vk::DependencyInfo{.bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &to_host});
-        for (auto& [owned, layout] : restore)
-            if (layout != vk::ImageLayout::eUndefined && layout != owned->layout)
-                owned->Transit(command, layout, vk::PipelineStageFlagBits2::eAllCommands,
-                               vk::AccessFlagBits2::eMemoryRead);
+        const auto file_name = [](const std::string& stem, const DumpPart& part) {
+            return fmt::format("{}_{}_{}x{}_{}.bin", stem, part.name, part.extent.width,
+                               part.extent.height, vk::to_string(part.format));
+        };
+        for (const auto& part : parts)
+            meta += fmt::format("file {} {} {} {} {}\n", part.name, file_name(stem, part),
+                                part.extent.width, part.extent.height,
+                                vk::to_string(part.format));
+        const auto dir = BbDlssSettingsPath().parent_path() / "dlss_dump";
+        std::string meta_file = stem + "_" + meta_name + ".txt";
+        scheduler.DeferOperation([buffer, parts, meta, dir, stem, meta_file, total, file_name] {
+            buffer->Invalidate(0, total);
+            auto data = std::make_shared<std::vector<u8>>(buffer->mapped_data.begin(),
+                                                          buffer->mapped_data.begin() + total);
+            std::thread([data, parts, meta, dir, stem, meta_file, file_name] {
+                std::error_code error;
+                std::filesystem::create_directories(dir, error);
+                for (const auto& part : parts) {
+                    std::ofstream file{dir / file_name(stem, part), std::ios::binary};
+                    file.write(reinterpret_cast<const char*>(data->data() + part.offset),
+                               std::streamsize(part.bytes));
+                }
+                std::ofstream{dir / meta_file} << meta;
+            }).detach();
+        });
+    }
+
+    // Diagnostic: this frame's upscaler inputs (and output).
+    void DumpFrame(const Instance& instance, Runtime& runtime, Scheduler& scheduler,
+                   vk::CommandBuffer command, VideoCore::Image& depth, vk::Extent2D in,
+                   vk::Extent2D out, const DlssNgx::EvalDesc& eval,
+                   const std::array<float, 2>& applied, bool linear) {
+        std::vector<DumpPart> parts;
+        const bool depth_copyable =
+            bool(depth.backing->image.image_ci.usage & vk::ImageUsageFlagBits::eTransferSrc);
+        parts.push_back({"color", snapshot->image.image, in, snapshot->format});
+        if (depth_copyable)
+            parts.push_back({"depth", depth.GetImage(), in, vk::Format::eR32Sfloat});
+        parts.push_back({"motion", motion->image.image, in, motion->format});
+        OwnedImage* const output_image = tune.dump_output ? upscaled.get() : nullptr;
+        if (output_image)
+            parts.push_back({"output", output_image->image.image, output_image->extent,
+                             output_image->format});
+
+        if (depth_copyable) {
+            runtime.Transit(&depth, vk::ImageLayout::eTransferSrcOptimal,
+                            vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
+            runtime.FlushBarriers();
+        }
+        std::vector<std::pair<OwnedImage*, vk::ImageLayout>> restore;
+        for (auto* owned : {snapshot.get(), motion.get(), output_image}) {
+            if (!owned)
+                continue;
+            restore.emplace_back(owned, owned->layout);
+            owned->Transit(command, vk::ImageLayout::eTransferSrcOptimal,
+                           vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
+        }
 
         // Everything needed to redo the motion pass and judge the frame offline.
         const auto join = [](const auto& values) {
@@ -948,13 +977,13 @@ struct BbTemporalDlss::Impl {
             "reset={} frame_ms={:.3f} jittered_draws={} jittered_before_copy={}\n"
             "motion_flags={:#x} (1 snap, 2 scene camera, 0x100 object motion)\n"
             "tune_jitter={} sign={} {} object_motion={} scene_camera={} camera_snap={} "
-            "preset={} quality={}\n",
+            "preset={} quality={} hud={}\n",
             tune.dump, dump_index, frame, evaluations + 1, BackendName(backend), in.width,
             in.height, out.width, out.height, vk::to_string(snapshot->format), linear,
             applied[0], applied[1], eval.jitter_x, eval.jitter_y, eval.reset, frame_ms,
             jittered_draws, jittered_before_copy, motion_flags, tune.jitter, tune.sign_x,
             tune.sign_y, tune.mirror, tune.scene_camera, tune.camera_snap, tune.preset,
-            tune.quality);
+            tune.quality, tune.hud);
         meta += "motion_push(reproject12 proj4 prev_proj4 jitter2)=" + join(motion_constants) + "\n";
         meta += fmt::format("camera_valid={} previous_valid={}\n", camera.valid,
                             previous_camera.valid);
@@ -965,35 +994,47 @@ struct BbTemporalDlss::Impl {
         meta += "previous_inv_view=" + join(previous_camera.inv_view) + "\n";
         meta += "previous_proj=" + join(previous_camera.proj) + "\n";
         const auto stem = fmt::format("d{}_f{:02}", tune.dump, dump_index);
-        for (const auto& part : parts) {
-            const auto file = fmt::format("{}_{}_{}x{}_{}.bin", stem, part.name, part.extent.width,
-                                          part.extent.height, vk::to_string(part.format));
-            meta += fmt::format("file {} {} {} {} {}\n", part.name, file, part.extent.width,
-                                part.extent.height, vk::to_string(part.format));
-        }
-        const auto dir = BbDlssSettingsPath().parent_path() / "dlss_dump";
-        scheduler.DeferOperation([buffer, parts, meta, dir, stem, total] {
-            buffer->Invalidate(0, total);
-            auto data = std::make_shared<std::vector<u8>>(buffer->mapped_data.begin(),
-                                                          buffer->mapped_data.begin() + total);
-            std::thread([data, parts, meta, dir, stem] {
-                std::error_code error;
-                std::filesystem::create_directories(dir, error);
-                for (const auto& part : parts) {
-                    std::ofstream file{dir / fmt::format("{}_{}_{}x{}_{}.bin", stem, part.name,
-                                                         part.extent.width, part.extent.height,
-                                                         vk::to_string(part.format)),
-                                       std::ios::binary};
-                    file.write(reinterpret_cast<const char*>(data->data() + part.offset),
-                               std::streamsize(part.bytes));
-                }
-                std::ofstream{dir / (stem + "_meta.txt")} << meta;
-            }).detach();
-        });
+        WriteDump(instance, scheduler, command, std::move(parts), std::move(meta), stem, "meta");
+        for (auto& [owned, layout] : restore)
+            if (layout != vk::ImageLayout::eUndefined && layout != owned->layout)
+                owned->Transit(command, layout, vk::PipelineStageFlagBits2::eAllCommands,
+                               vk::AccessFlagBits2::eMemoryRead);
+        dump_composite = stem; // the display composite of this frame is dumped too
         ++dump_index;
         if (--dump_left == 0)
-            LOG_INFO(Render_Vulkan, "[DLSS-DUMP] Dump {} recorded: {} frames into {}", tune.dump,
-                     dump_index, dir.string());
+            LOG_INFO(Render_Vulkan, "[DLSS-DUMP] Dump {} recorded: {} frames", tune.dump,
+                     dump_index);
+    }
+
+    // Diagnostic: the composite's other inputs, the game's own frame with its HUD (render size),
+    // and what the composite made of it (output size, after the display LUT).
+    void DumpComposite(const Instance& instance, Runtime& runtime, Scheduler& scheduler,
+                       vk::CommandBuffer command, VideoCore::Image& game_frame,
+                       OwnedImage& written, const std::string& stem, u32 flags) {
+        std::vector<DumpPart> parts;
+        if (game_frame.backing->image.image_ci.usage & vk::ImageUsageFlagBits::eTransferSrc) {
+            runtime.Transit(&game_frame, vk::ImageLayout::eTransferSrcOptimal,
+                            vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
+            runtime.FlushBarriers();
+            parts.push_back({"final", game_frame.GetImage(),
+                             {game_frame.info.size.width, game_frame.info.size.height},
+                             game_frame.info.pixel_format});
+        }
+        written.Transit(command, vk::ImageLayout::eTransferSrcOptimal,
+                        vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
+        parts.push_back({"composite", written.image.image, written.extent, written.format});
+        u32 changed{};
+        if (coverage && composites >= CoverageSlots)
+            std::memcpy(&changed,
+                        coverage->mapped_data.data() + (composites % CoverageSlots) * CoverageStride,
+                        sizeof(changed));
+        std::string meta = fmt::format(
+            "composite_flags={:#x} (1 hud, 2 lut, 4 debug, 8 menu, 16 linear, 32 alpha, 128 hdr)\n"
+            "menu={} hud_changed_pixels_3_frames_ago={} share={:.4f} final_format={}\n",
+            flags, menu, changed, double(changed) / (double(output.width) * output.height),
+            vk::to_string(game_frame.info.pixel_format));
+        WriteDump(instance, scheduler, command, std::move(parts), std::move(meta), stem,
+                  "composite");
     }
 
     void InvalidateOutputs() {
@@ -1618,12 +1659,15 @@ void BbTemporalDlss::Impl::Composite(const Instance& instance, Runtime& runtime,
         if (outputs_slot || pre_lut)
             scheduler.Finish();
         using U = vk::ImageUsageFlagBits;
+        // Transfer source: the diagnostic dump copies the composited frame.
         outputs_slot = std::make_unique<OwnedImage>(
             instance, output_format, output,
-            replay ? U::eSampled | U::eColorAttachment : U::eSampled | U::eStorage, true);
+            (replay ? U::eSampled | U::eColorAttachment : U::eSampled | U::eStorage) |
+                U::eTransferSrc,
+            true);
         if (replay)
             pre_lut = std::make_unique<OwnedImage>(instance, pre_lut_format, output,
-                                                   U::eSampled | U::eStorage);
+                                                   U::eSampled | U::eStorage | U::eTransferSrc);
     }
     // FSR frame generation moves whatever differs from its HUD-less image as UI instead of
     // interpolating it, so it gets the frame composited a second time without the HUD.
@@ -1753,6 +1797,13 @@ void BbTemporalDlss::Impl::Composite(const Instance& instance, Runtime& runtime,
         command.pushConstants(*pass.layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
                               &push);
         command.dispatch((output.width + 7) / 8, (output.height + 7) / 8, 1);
+    }
+    if (auto stem = std::exchange(dump_composite, std::nullopt)) {
+        try {
+            DumpComposite(instance, runtime, scheduler, command, source, written, *stem, flags);
+        } catch (const std::exception& e) {
+            LOG_ERROR(Render_Vulkan, "[DLSS-DUMP] Composite not dumped: {}", e.what());
+        }
     }
     outputs_slot->hudless_fresh = written_hudless != nullptr;
     if (replay) {
