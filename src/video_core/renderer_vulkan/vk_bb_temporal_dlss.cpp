@@ -307,7 +307,9 @@ struct Tune {
     bool fg_reflex = true, fg_reflex_sleep = false; // hidden: Reflex mode and sleep
     bool fsr4_linear = true; // FSR 4 gets linear-light colour instead of sRGB-encoded
     bool camera_snap = true;
-    bool scene_camera = true;
+    // Camera motion from the game's scene constants: 0 off (motion-blur matrix), 1 as first
+    // written (view y taken as up), 2 view y down, which is what the game uses.
+    int scene_camera = 2;
     float sharpness = 0.6f;
     bool swap = false;
     bool depth_inverted = false;
@@ -488,7 +490,7 @@ struct BbTemporalDlss::Impl {
             else if (key == "sharpness")
                 next.sharpness = std::clamp(float(std::atof(value.c_str())), 0.f, 1.f);
             else if (key == "scene_camera")
-                next.scene_camera = number != 0;
+                next.scene_camera = std::clamp(number, 0, 2);
             else if (key == "camera_snap")
                 next.camera_snap = number != 0;
             else if (key == "debug_motion")
@@ -841,9 +843,11 @@ struct BbTemporalDlss::Impl {
                     r[i * 4 + j] = float(m[j * 4 + i]);
             return r;
         };
-        // D3D-style clip space: z_clip = zs * z + zo * w, w_clip = z.
-        const auto projection = [](const std::array<float, 4>& p) {
-            return Mat{p[0], 0, 0, 0, 0, p[1], 0, 0, 0, 0, p[2], p[3], 0, 0, 1, 0};
+        // D3D-style clip space: z_clip = zs * z + zo * w, w_clip = z. The game's view space has
+        // y pointing down, clip space has it up.
+        const double y_sign = tune.scene_camera == 1 ? 1.0 : -1.0;
+        const auto projection = [y_sign](const std::array<float, 4>& p) {
+            return Mat{p[0], 0, 0, 0, 0, y_sign * p[1], 0, 0, 0, 0, p[2], p[3], 0, 0, 1, 0};
         };
         Mat view_to_prev_view{};
         const auto& a = previous_camera.view;
@@ -873,10 +877,11 @@ struct BbTemporalDlss::Impl {
         inputs.clip_to_view = out(clip_to_view);
         inputs.clip_to_prev_clip = out(clip_to_prev_clip);
         inputs.prev_clip_to_clip = out(invert(clip_to_prev_clip));
-        // The inverse view's columns: camera right, up, forward and position in the world.
+        // The inverse view's columns: camera right, down (up with y_sign 1), forward and
+        // position in the world.
         for (int i = 0; i < 3; ++i) {
             inputs.right[i] = float(b[i * 4 + 0]);
-            inputs.up[i] = float(b[i * 4 + 1]);
+            inputs.up[i] = float(y_sign * b[i * 4 + 1]);
             inputs.forward[i] = float(b[i * 4 + 2]);
             inputs.position[i] = float(b[i * 4 + 3]);
         }
@@ -1010,7 +1015,7 @@ struct BbTemporalDlss::Impl {
             "render={}x{} output={}x{} color_format={} upscaler_input_linear={}\n"
             "jitter_applied_render_px={:.6f} {:.6f}\njitter_sent={:.6f} {:.6f}\n"
             "reset={} frame_ms={:.3f} jittered_draws={} jittered_before_copy={}\n"
-            "motion_flags={:#x} (1 snap, 2 scene camera, 0x100 object motion)\n"
+            "motion_flags={:#x} (1 snap, 2 scene camera, 4 view y down, 0x100 object motion)\n"
             "tune_jitter={} sign={} {} object_motion={} scene_camera={} camera_snap={} "
             "preset={} quality={} hud={}\n",
             tune.dump, dump_index, frame, evaluations + 1, BackendName(backend), in.width,
@@ -1137,7 +1142,7 @@ struct BbTemporalDlss::Impl {
                            "preset{} camera{} snap{}",
                            tune.exp_mirror, tune.exp_reset ? 1 : 0, tune.exp_mv_x, tune.exp_mv_y,
                            tune.jitter ? 1 : 0, tune.mirror ? 1 : 0, tune.sign_x, tune.sign_y,
-                           tune.preset, tune.scene_camera ? 1 : 0, tune.camera_snap ? 1 : 0);
+                           tune.preset, tune.scene_camera, tune.camera_snap ? 1 : 0);
     }
 
     void FlushMeterStep() {
@@ -1856,7 +1861,8 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         push.jitter[0] = applied[0];
         push.jitter[1] = applied[1];
         push.use_mirror = use_mirror ? 1u : 0u;
-        push.flags = (tune.camera_snap ? 1u : 0u) | (scene_camera ? 2u : 0u);
+        push.flags = (tune.camera_snap ? 1u : 0u) | (scene_camera ? 2u : 0u) |
+                     (scene_camera && tune.scene_camera == 2 ? 4u : 0u);
         push.mv_scale[0] = tune.exp_mv_x;
         push.mv_scale[1] = tune.exp_mv_y;
         push.err_grid_w = error_grid_w;
