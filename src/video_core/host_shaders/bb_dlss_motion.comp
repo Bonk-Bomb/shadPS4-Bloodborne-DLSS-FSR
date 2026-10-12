@@ -7,6 +7,10 @@ layout(binding=1) uniform sampler2D velocity_mirror;
 layout(binding=2, rg16f) uniform writeonly image2D motion;
 // [0, 1024): constants of producer 0xd3c8bb21. [1024, 1026): geometry velocity packing scale.
 layout(binding=3, std430) readonly buffer Coefficients { float c[]; };
+// Diagnostics: the game's own (motion-blur matrix) motion, used as a reference, and per 32x32
+// cell the summed difference between it and the scene-camera motion (x64) with a pixel count.
+layout(binding=4, rg16f) uniform writeonly image2D reference_motion;
+layout(binding=5, std430) buffer MotionError { uint errors[]; };
 layout(push_constant) uniform Push {
     vec4 reproject[3]; // previous view * inverse current view (3x4 rows, built in double)
     vec4 proj;         // current projection: x scale, y scale, z scale, z offset
@@ -15,14 +19,19 @@ layout(push_constant) uniform Push {
     uint use_mirror;   // object velocity covered pixels override camera motion
     uint flags;        // 1: snap matrix rounding noise, 2: scene camera matrices valid
     vec2 mv_scale;     // diagnostic multiplier on the result (1, 1 normally)
+    uint err_grid_w;   // cells per row of MotionError
+    uint err_enabled;
 } pc;
 shared mat4 previous_from_current;
 shared uint matrix_valid;
+shared uint s_err, s_count;
 
 bool finite4(vec4 value) { return !any(isnan(value)) && !any(isinf(value)); }
 
 void main() {
     if (gl_LocalInvocationIndex == 0) {
+        s_err = 0;
+        s_count = 0;
         vec4 r0 = vec4(c[0x380], c[0x381], c[0x382], c[0x383]);
         vec4 r1 = vec4(c[0x384], c[0x385], c[0x386], c[0x387]);
         vec4 r2 = vec4(c[0x388], c[0x389], c[0x38a], c[0x38b]);
@@ -50,7 +59,7 @@ void main() {
     barrier();
     ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     ivec2 extent = imageSize(motion);
-    if (any(greaterThanEqual(pixel, extent))) return;
+    if (all(lessThan(pixel, extent))) {
     float raw_depth = texelFetch(scene_depth, pixel, 0).r;
     float depth = clamp(c[0x26c]*(c[0]*raw_depth+c[1])+c[0x26d], 0, 1);
     // The surface seen by this jittered pixel lies at its unjittered position.
@@ -60,6 +69,7 @@ void main() {
     bool valid = matrix_valid != 0 && finite4(previous) && previous.w > 1e-6;
     vec2 delta = valid ? (previous.xy/previous.w-current.xy)*
                         vec2(float(extent.x)*0.5, -float(extent.y)*0.5) : vec2(0);
+    vec2 reference = delta;
     if ((pc.flags & 2u) != 0) {
         // View-space reprojection from the game's scene constants: the camera-relative
         // transform is small and exact, unlike the motion-blur matrix built in float32.
@@ -73,7 +83,13 @@ void main() {
         vec2 prev_ndc = vec2(prev_view.x * pc.prev_proj.x, prev_view.y * pc.prev_proj.y) /
                         max(prev_view.z, 1e-4);
         vec2 prev_uv = vec2(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
-        delta = (prev_uv - uv) * vec2(extent);
+        const vec2 scene_delta = (prev_uv - uv) * vec2(extent);
+        if (pc.err_enabled != 0 && valid && !sky && !any(isnan(scene_delta))) {
+            atomicAdd(s_err, uint(min(length(scene_delta - delta), 64.0) * 64.0 + 0.5));
+            atomicAdd(s_count, 1u);
+        }
+        reference = delta;
+        delta = scene_delta;
     }
     vec2 camera = delta;
     float coverage = -1;
@@ -83,11 +99,28 @@ void main() {
         float sx = c[1024], sy = c[1025];
         if (m.a > 0.5 && abs(sx) > 1e-6 && abs(sy) > 1e-6 && !isinf(sx) && !isinf(sy) &&
             !isnan(sx) && !isnan(sy))
+        {
             delta = (m.rg - 0.5) * vec2(-float(extent.x) / sx, float(extent.y) / sy);
+            reference = delta;
+        }
     }
     delta *= pc.mv_scale;
     if (any(isnan(delta)) || any(isinf(delta)) || any(greaterThan(abs(delta), vec2(extent))))
         delta = vec2(0);
+    if (any(isnan(reference)) || any(isinf(reference)) ||
+        any(greaterThan(abs(reference), vec2(extent))))
+        reference = vec2(0);
     // Current-to-previous motion in render pixels, as NGX expects with MVLowRes.
     imageStore(motion, pixel, vec4(delta, 0, 0));
+    imageStore(reference_motion, pixel, vec4(reference, 0, 0));
+    }
+    if (pc.err_enabled != 0) {
+        barrier();
+        if (gl_LocalInvocationIndex == 0 && s_count != 0) {
+            uvec2 cell = gl_WorkGroupID.xy / 4u;
+            uint i = (cell.y * pc.err_grid_w + cell.x) * 2u;
+            atomicAdd(errors[i], s_err);
+            atomicAdd(errors[i + 1], s_count);
+        }
+    }
 }
