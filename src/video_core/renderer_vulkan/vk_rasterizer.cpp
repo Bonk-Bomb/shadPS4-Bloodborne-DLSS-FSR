@@ -895,7 +895,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
                 temporal_dlss.ObserveConstants(runtime, instance, &vk_buffer, offset, ubo_size,
                                                stage.pgm_hash, binding.unified);
-                temporal_dlss.ObserveSceneConstants(stage.flattened_ud_buf.data(), ubo_size);
+                temporal_dlss.ObserveSceneConstants(stage.flattened_ud_buf.data(), ubo_size,
+                                                    stage.pgm_hash, binding.unified);
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the
                 // declared binding is satisfied with a null descriptor instead of a copy.
@@ -962,7 +963,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     temporal_dlss.ObserveConstants(runtime, instance, buffer, offset, size,
                                                    stage.pgm_hash, binding.unified);
                     temporal_dlss.ObserveSceneConstants(
-                        reinterpret_cast<const void*>(vsharp.base_address), size);
+                        reinterpret_cast<const void*>(vsharp.base_address), size, stage.pgm_hash,
+                        binding.unified);
                 }
             }
         }

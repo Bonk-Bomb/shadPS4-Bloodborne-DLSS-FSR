@@ -307,8 +307,10 @@ struct Tune {
     bool fg_reflex = true, fg_reflex_sleep = false; // hidden: Reflex mode and sleep
     bool fsr4_linear = true; // FSR 4 gets linear-light colour instead of sRGB-encoded
     bool camera_snap = true;
-    // Camera motion from the game's scene constants: 0 off (motion-blur matrix), 1 as first
-    // written (view y taken as up), 2 view y down, which is what the game uses.
+    // Camera motion from the game's scene constants instead of its motion-blur matrix:
+    // 0 off, 1 the first scene constants of each frame (as first written), 2 the cameras whose
+    // reprojection matches the motion-blur matrix. A planar reflection pass can render first
+    // with the same constants layout, and its camera moves as a mirror image of the main one.
     int scene_camera = 2;
     float sharpness = 0.6f;
     bool swap = false;
@@ -404,6 +406,18 @@ struct BbTemporalDlss::Impl {
     } camera, previous_camera;
     bool frame_has_camera{}, camera_this_frame{};
     u64 scene_camera_frames{};
+    // Every distinct camera of this frame and of the previous one; SelectCamera picks the pair.
+    std::array<Camera, 4> candidates{}, previous_candidates{};
+    u32 candidate_count{}, previous_candidate_count{};
+    // The motion-blur matrix (previous clip -> current clip) and the depth remap it expects,
+    // as the CPU saw them at the depth producer: c[0x380..0x38f], c[0], c[1], c[0x26c], c[0x26d].
+    std::array<float, 16> blur_rows{};
+    std::array<float, 4> blur_depth{};
+    bool blur_rows_valid{};
+    bool camera_trusted{};
+    int chosen_candidate = -1;
+    float camera_match_px = -1.f;
+    u64 camera_rejects{}, camera_switches{}, camera_unchecked{};
     std::unique_ptr<OwnedImage> snapshot, motion, upscaled;
     std::unique_ptr<OwnedImage> linear_color; // FSR 4 input
     std::unique_ptr<OwnedImage> sharpened;    // decoupled UI: the upscaled scene, sharpened
@@ -633,6 +647,7 @@ struct BbTemporalDlss::Impl {
     // After each evaluation attempt: per-frame guide inputs restart and the jitter advances.
     void FrameBoundary(Scheduler& scheduler, BbVelocityMirror& mirror) {
         camera_constants = velocity_constants = depth_learned = false;
+        blur_rows_valid = false;
         jittered_draws = jittered_before_copy = 0;
         producer_constants = producer_depths = velocity_draw_constants = 0;
         r32_depth.reset();
@@ -649,6 +664,9 @@ struct BbTemporalDlss::Impl {
         evaluated_since_copy = false;
         // Camera frames run display copy to display copy: HUD/post passes after the evaluation
         // may bind the same scene constants again.
+        previous_candidates = candidates;
+        previous_candidate_count = candidate_count;
+        candidate_count = 0;
         if (!frame_has_camera)
             camera.valid = previous_camera.valid = false;
         frame_has_camera = false;
@@ -748,6 +766,133 @@ struct BbTemporalDlss::Impl {
         return result;
     }
 
+    // How far apart, in render pixels on average, the previous-frame positions of a few
+    // points come out between the scene-camera pair and the game's motion-blur matrix.
+    double CameraMismatch(const Camera& prev, const Camera& cur,
+                          const std::array<double, 16>& previous_from_current,
+                          vk::Extent2D in) const {
+        std::array<double, 12> r{};
+        const auto& a = prev.view;
+        const auto& b = cur.inv_view;
+        for (int i = 0; i < 3; ++i)
+            for (int col = 0; col < 4; ++col)
+                r[i * 4 + col] = a[i * 4 + 0] * b[0 * 4 + col] + a[i * 4 + 1] * b[1 * 4 + col] +
+                                 a[i * 4 + 2] * b[2 * 4 + col] + (col == 3 ? a[i * 4 + 3] : 0.0);
+        const auto& m = previous_from_current;
+        double sum = 0;
+        int n = 0;
+        for (const double z : {1.5, 6.0, 30.0})
+            for (const double y : {-0.7, 0.0, 0.7})
+                for (const double x : {-0.7, 0.0, 0.7}) {
+                    const double v[4] = {x * z / cur.proj[0], y * z / cur.proj[1], z, 1.0};
+                    double pv[3];
+                    for (int i = 0; i < 3; ++i)
+                        pv[i] = r[i * 4] * v[0] + r[i * 4 + 1] * v[1] + r[i * 4 + 2] * v[2] +
+                                r[i * 4 + 3];
+                    if (pv[2] <= 1e-4)
+                        continue;
+                    const double sx = pv[0] * prev.proj[0] / pv[2];
+                    const double sy = pv[1] * prev.proj[1] / pv[2];
+                    const double raw = cur.proj[2] + cur.proj[3] / z;
+                    const double depth =
+                        blur_depth[2] * (blur_depth[0] * raw + blur_depth[1]) + blur_depth[3];
+                    const double c[4] = {x, y, depth, 1.0};
+                    double p[4];
+                    for (int i = 0; i < 4; ++i)
+                        p[i] = m[i * 4] * c[0] + m[i * 4 + 1] * c[1] + m[i * 4 + 2] * c[2] +
+                               m[i * 4 + 3] * c[3];
+                    if (std::abs(p[3]) < 1e-9)
+                        continue;
+                    sum += std::hypot((sx - p[0] / p[3]) * in.width * 0.5,
+                                      (sy - p[1] / p[3]) * in.height * 0.5);
+                    ++n;
+                }
+        return n ? sum / n : std::numeric_limits<double>::infinity();
+    }
+
+    // Picks this frame's main camera and the previous frame's among the scene constants seen.
+    void SelectCamera(vk::Extent2D in) {
+        camera.valid = previous_camera.valid = camera_trusted = false;
+        camera_match_px = -1.f;
+        if (candidate_count == 0 || previous_candidate_count == 0)
+            return;
+        // As first written: the first scene constants of each frame. Also the fallback for frame
+        // generation when the game's matrix was not seen.
+        camera = candidates[0];
+        previous_camera = previous_candidates[0];
+        if (tune.scene_camera == 1) {
+            camera_trusted = true;
+            return;
+        }
+        if (!blur_rows_valid) {
+            ++camera_unchecked;
+            return;
+        }
+        std::array<double, 16> blur{};
+        for (int i = 0; i < 16; ++i)
+            blur[i] = blur_rows[i];
+        // Rows of the game's matrix take previous clip positions to current ones.
+        std::array<double, 16> inverse{};
+        {
+            auto m = blur;
+            for (int i = 0; i < 4; ++i)
+                inverse[i * 4 + i] = 1.0;
+            for (int c = 0; c < 4; ++c) {
+                int pivot = c;
+                for (int i = c + 1; i < 4; ++i)
+                    if (std::abs(m[i * 4 + c]) > std::abs(m[pivot * 4 + c]))
+                        pivot = i;
+                if (std::abs(m[pivot * 4 + c]) < 1e-12 || !std::isfinite(m[pivot * 4 + c])) {
+                    ++camera_unchecked;
+                    return;
+                }
+                for (int j = 0; j < 4; ++j) {
+                    std::swap(m[c * 4 + j], m[pivot * 4 + j]);
+                    std::swap(inverse[c * 4 + j], inverse[pivot * 4 + j]);
+                }
+                const double d = m[c * 4 + c];
+                for (int j = 0; j < 4; ++j) {
+                    m[c * 4 + j] /= d;
+                    inverse[c * 4 + j] /= d;
+                }
+                for (int i = 0; i < 4; ++i) {
+                    if (i == c)
+                        continue;
+                    const double f = m[i * 4 + c];
+                    for (int j = 0; j < 4; ++j) {
+                        m[i * 4 + j] -= f * m[c * 4 + j];
+                        inverse[i * 4 + j] -= f * inverse[c * 4 + j];
+                    }
+                }
+            }
+        }
+        double best = std::numeric_limits<double>::infinity();
+        u32 best_k = 0, best_j = 0;
+        for (u32 k = 0; k < previous_candidate_count; ++k)
+            for (u32 j = 0; j < candidate_count; ++j) {
+                double e = CameraMismatch(previous_candidates[k], candidates[j], inverse, in);
+                // A still camera matches with every self pair: stay with the camera in use.
+                if (int(j) == chosen_candidate)
+                    e -= 0.05;
+                if (e < best) {
+                    best = e;
+                    best_k = k;
+                    best_j = j;
+                }
+            }
+        camera = candidates[best_j];
+        previous_camera = previous_candidates[best_k];
+        camera_match_px = float(best);
+        camera_trusted = best < 2.0;
+        if (!camera_trusted) {
+            ++camera_rejects;
+            return;
+        }
+        if (int(best_j) != chosen_candidate && chosen_candidate >= 0)
+            ++camera_switches;
+        chosen_candidate = int(best_j);
+    }
+
     // Copies this frame's depth and motion for frame generation and describes its camera.
     void CaptureFrameGen(const Instance& instance, Runtime& runtime, Scheduler& scheduler,
                          vk::CommandBuffer command, VideoCore::Image& depth, vk::Extent2D in,
@@ -843,11 +988,9 @@ struct BbTemporalDlss::Impl {
                     r[i * 4 + j] = float(m[j * 4 + i]);
             return r;
         };
-        // D3D-style clip space: z_clip = zs * z + zo * w, w_clip = z. The game's view space has
-        // y pointing down, clip space has it up.
-        const double y_sign = tune.scene_camera == 1 ? 1.0 : -1.0;
-        const auto projection = [y_sign](const std::array<float, 4>& p) {
-            return Mat{p[0], 0, 0, 0, 0, y_sign * p[1], 0, 0, 0, 0, p[2], p[3], 0, 0, 1, 0};
+        // D3D-style clip space: z_clip = zs * z + zo * w, w_clip = z.
+        const auto projection = [](const std::array<float, 4>& p) {
+            return Mat{p[0], 0, 0, 0, 0, p[1], 0, 0, 0, 0, p[2], p[3], 0, 0, 1, 0};
         };
         Mat view_to_prev_view{};
         const auto& a = previous_camera.view;
@@ -877,11 +1020,10 @@ struct BbTemporalDlss::Impl {
         inputs.clip_to_view = out(clip_to_view);
         inputs.clip_to_prev_clip = out(clip_to_prev_clip);
         inputs.prev_clip_to_clip = out(invert(clip_to_prev_clip));
-        // The inverse view's columns: camera right, down (up with y_sign 1), forward and
-        // position in the world.
+        // The inverse view's columns: camera right, up, forward and position in the world.
         for (int i = 0; i < 3; ++i) {
             inputs.right[i] = float(b[i * 4 + 0]);
-            inputs.up[i] = float(y_sign * b[i * 4 + 1]);
+            inputs.up[i] = float(b[i * 4 + 1]);
             inputs.forward[i] = float(b[i * 4 + 2]);
             inputs.position[i] = float(b[i * 4 + 3]);
         }
@@ -1015,7 +1157,7 @@ struct BbTemporalDlss::Impl {
             "render={}x{} output={}x{} color_format={} upscaler_input_linear={}\n"
             "jitter_applied_render_px={:.6f} {:.6f}\njitter_sent={:.6f} {:.6f}\n"
             "reset={} frame_ms={:.3f} jittered_draws={} jittered_before_copy={}\n"
-            "motion_flags={:#x} (1 snap, 2 scene camera, 4 view y down, 0x100 object motion)\n"
+            "motion_flags={:#x} (1 snap, 2 scene camera, 0x100 object motion)\n"
             "tune_jitter={} sign={} {} object_motion={} scene_camera={} camera_snap={} "
             "preset={} quality={} hud={}\n",
             tune.dump, dump_index, frame, evaluations + 1, BackendName(backend), in.width,
@@ -1025,8 +1167,14 @@ struct BbTemporalDlss::Impl {
             tune.sign_y, tune.mirror, tune.scene_camera, tune.camera_snap, tune.preset,
             tune.quality, tune.hud);
         meta += "motion_push(reproject12 proj4 prev_proj4 jitter2)=" + join(motion_constants) + "\n";
-        meta += fmt::format("camera_valid={} previous_valid={}\n", camera.valid,
-                            previous_camera.valid);
+        meta += fmt::format("camera_valid={} previous_valid={} trusted={} match_px={:.3f} "
+                            "candidates={} previous_candidates={} chosen={}\n",
+                            camera.valid, previous_camera.valid, camera_trusted, camera_match_px,
+                            candidate_count, previous_candidate_count, chosen_candidate);
+        for (u32 i = 0; i < candidate_count; ++i)
+            meta += fmt::format("candidate{}_view=", i) + join(candidates[i].view) + "\n";
+        meta += "blur_rows=" + join(blur_rows) + "\n";
+        meta += "blur_depth=" + join(blur_depth) + "\n";
         meta += "camera_view=" + join(camera.view) + "\n";
         meta += "camera_inv_view=" + join(camera.inv_view) + "\n";
         meta += "camera_proj=" + join(camera.proj) + "\n";
@@ -1747,6 +1895,7 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
                       vk::AccessFlagBits2::eShaderRead);
 
     // Motion: camera reprojection, replaced by object velocity where the mirror covers.
+    SelectCamera(in);
     const auto mirror_frame = mirror.ConsumeFrame(command);
     mirror.SetTargetSize(in);
     const bool use_mirror =
@@ -1840,8 +1989,8 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
             float mv_scale[2];
             u32 err_grid_w, err_enabled;
         } push{};
-        const bool scene_camera =
-            tune.scene_camera && frame_has_camera && camera.valid && previous_camera.valid;
+        const bool scene_camera = tune.scene_camera && frame_has_camera && camera.valid &&
+                                  previous_camera.valid && camera_trusted;
         if (scene_camera) {
             // previous view * current inverse view, both affine 3x4, in double precision.
             const auto& a = previous_camera.view;
@@ -1861,8 +2010,7 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         push.jitter[0] = applied[0];
         push.jitter[1] = applied[1];
         push.use_mirror = use_mirror ? 1u : 0u;
-        push.flags = (tune.camera_snap ? 1u : 0u) | (scene_camera ? 2u : 0u) |
-                     (scene_camera && tune.scene_camera == 2 ? 4u : 0u);
+        push.flags = (tune.camera_snap ? 1u : 0u) | (scene_camera ? 2u : 0u);
         push.mv_scale[0] = tune.exp_mv_x;
         push.mv_scale[1] = tune.exp_mv_y;
         push.err_grid_w = error_grid_w;
@@ -2078,10 +2226,11 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
                  "[DLSS-TEMPORAL] {} evaluations={} {}x{}->{}x{} preHUD={} "
                  "jitter=({:.3f},{:.3f}) "
                  "jitteredDraws={} (before display copy {}) objectMotion={} reset={} fallbacks={} "
-                 "sceneCameraFrames={}",
+                 "sceneCameraFrames={} cameraRejects={} cameraSwitches={} cameraUnchecked={}",
                  BackendName(backend), evaluations, in.width, in.height, out.width, out.height,
                  pre_hud, applied[0], applied[1], jittered_draws, jittered_before_copy, use_mirror,
-                 reset, fallbacks, scene_camera_frames);
+                 reset, fallbacks, scene_camera_frames, camera_rejects, camera_switches,
+                 camera_unchecked);
     return true;
 }
 
@@ -2317,22 +2466,36 @@ void BbTemporalDlss::ObserveTexture(const VideoCore::Image& image, VideoCore::Im
         impl->hdr_copy_source = Impl::Bound{id, view};
 }
 
-void BbTemporalDlss::ObserveSceneConstants(const void* data, u64 size) {
+void BbTemporalDlss::ObserveSceneConstants(const void* data, u64 size, u64 hash, u32 binding) {
     auto& s = *impl;
-    if (!s.requested || s.failed || s.stopped || s.frame_has_camera || !data ||
-        size < 192 * sizeof(float))
+    if (!s.requested || s.failed || s.stopped || !data)
         return;
     const auto* f = static_cast<const float*>(data);
+    if (hash == DepthProducer && binding == 0 && !s.blur_rows_valid &&
+        size >= (0x380 + 16) * sizeof(float) && size >= (0x26d + 1) * sizeof(float)) {
+        std::copy_n(f + 0x380, 16, s.blur_rows.begin());
+        s.blur_depth = {f[0], f[1], f[0x26c], f[0x26d]};
+        s.blur_rows_valid = true;
+    }
+    if (size < 192 * sizeof(float))
+        return;
     if (f[0] != 3000.0f || std::abs(f[1] * f[0] - 1.0f) > 1e-3f || f[4] < 64.0f || f[5] < 64.0f)
         return;
-    // The first scene constants after an evaluation belong to the main camera of the next frame.
-    s.previous_camera = s.camera;
+    // Every distinct camera of the frame; the main one is picked at the evaluation.
+    Impl::Camera c;
     for (int i = 0; i < 12; ++i) {
-        s.camera.view[i] = f[8 + i];
-        s.camera.inv_view[i] = f[180 + i];
+        c.view[i] = f[8 + i];
+        c.inv_view[i] = f[180 + i];
     }
-    s.camera.proj = {f[52], f[57], f[62], f[63]};
-    s.camera.valid = f[52] != 0.0f && f[57] != 0.0f && std::isfinite(f[62]) && std::isfinite(f[63]);
+    c.proj = {f[52], f[57], f[62], f[63]};
+    c.valid = f[52] != 0.0f && f[57] != 0.0f && std::isfinite(f[62]) && std::isfinite(f[63]);
+    if (!c.valid)
+        return;
+    for (u32 i = 0; i < s.candidate_count; ++i)
+        if (s.candidates[i].view == c.view && s.candidates[i].proj == c.proj)
+            return;
+    if (s.candidate_count < s.candidates.size())
+        s.candidates[s.candidate_count++] = c;
     s.frame_has_camera = true;
 }
 
