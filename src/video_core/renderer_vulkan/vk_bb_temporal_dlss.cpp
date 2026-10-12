@@ -866,16 +866,25 @@ struct BbTemporalDlss::Impl {
                 }
             }
         }
+        std::array<double, 16> errors{};
         double best = std::numeric_limits<double>::infinity();
-        u32 best_k = 0, best_j = 0;
         for (u32 k = 0; k < previous_candidate_count; ++k)
             for (u32 j = 0; j < candidate_count; ++j) {
-                double e = CameraMismatch(previous_candidates[k], candidates[j], inverse, in);
-                // A still camera matches with every self pair: stay with the camera in use.
-                if (int(j) == chosen_candidate)
-                    e -= 0.05;
-                if (e < best) {
-                    best = e;
+                errors[k * 4 + j] =
+                    CameraMismatch(previous_candidates[k], candidates[j], inverse, in);
+                best = std::min(best, errors[k * 4 + j]);
+            }
+        // A still camera matches the reflection pair as well as the main one: among pairs that
+        // match equally well take the highest camera (world y is up; the reflection camera sits
+        // below the mirror plane).
+        u32 best_k = 0, best_j = 0;
+        double best_height = -std::numeric_limits<double>::infinity();
+        for (u32 k = 0; k < previous_candidate_count; ++k)
+            for (u32 j = 0; j < candidate_count; ++j) {
+                const double height =
+                    candidates[j].inv_view[7] + previous_candidates[k].inv_view[7];
+                if (errors[k * 4 + j] <= best + 0.05 && height > best_height) {
+                    best_height = height;
                     best_k = k;
                     best_j = j;
                 }
