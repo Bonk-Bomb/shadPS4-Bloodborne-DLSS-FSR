@@ -14,6 +14,7 @@ layout(push_constant) uniform Push {
     vec2 jitter;       // viewport offset of this frame's scene draws, render pixels (y down)
     uint use_mirror;   // object velocity covered pixels override camera motion
     uint flags;        // 1: snap matrix rounding noise, 2: scene camera matrices valid
+    vec2 mv_scale;     // diagnostic multiplier on the result (1, 1 normally)
 } pc;
 shared mat4 previous_from_current;
 shared uint matrix_valid;
@@ -84,6 +85,7 @@ void main() {
             !isnan(sx) && !isnan(sy))
             delta = (m.rg - 0.5) * vec2(-float(extent.x) / sx, float(extent.y) / sy);
     }
+    delta *= pc.mv_scale;
     if (any(isnan(delta)) || any(isinf(delta)) || any(greaterThan(abs(delta), vec2(extent))))
         delta = vec2(0);
     // Current-to-previous motion in render pixels, as NGX expects with MVLowRes.

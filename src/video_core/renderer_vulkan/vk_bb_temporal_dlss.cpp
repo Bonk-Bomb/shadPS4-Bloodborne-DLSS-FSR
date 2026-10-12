@@ -19,12 +19,17 @@
 #include <fmt/format.h>
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "input/bb_autopilot.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/host_shaders/bb_dlss_composite_comp.h"
 #include "video_core/host_shaders/bb_dlss_composite_hdr_comp.h"
 #include "video_core/host_shaders/bb_dlss_linearize_comp.h"
+#include "video_core/host_shaders/bb_dlss_mirror_r32f_comp.h"
+#include "video_core/host_shaders/bb_dlss_mirror_rg16f_comp.h"
+#include "video_core/host_shaders/bb_dlss_mirror_rgba16f_comp.h"
 #include "video_core/host_shaders/bb_dlss_motion_comp.h"
 #include "video_core/host_shaders/bb_dlss_sharpen_hdr_comp.h"
+#include "video_core/host_shaders/bb_flicker_meter_comp.h"
 #include "video_core/host_shaders/bb_hudless_dim_comp.h"
 #include "video_core/renderer_vulkan/vk_bb_resolution.h"
 #include "video_core/renderer_vulkan/vk_bb_temporal_dlss.h"
@@ -318,6 +323,15 @@ struct Tune {
     int dump = 0;
     u32 dump_frames = 10;
     bool dump_output = true;
+    // Diagnostic experiments, all live:
+    //   exp_mirror: 1 mirror the upscaler's inputs left-right (and its output back), 2 top-bottom
+    //   exp_reset:  restart the upscaler's history every frame
+    //   exp_mv_x/y: multiply the motion vectors
+    //   meter:      log the flicker meter (flicker_meter.csv, flicker_grid.csv)
+    int exp_mirror = 0;
+    bool exp_reset = false;
+    float exp_mv_x = 1.f, exp_mv_y = 1.f;
+    bool meter = false;
 };
 
 enum class Backend { None, Dlss, Fsr, Fsr4 };
@@ -405,6 +419,7 @@ struct BbTemporalDlss::Impl {
     bool upscaled_tone_mapped{}; // RenoDX: reversible tone map, values above 1 kept
     u32 producer_constants{}, producer_depths{}, velocity_draw_constants{};
     std::unordered_map<VAddr, std::unique_ptr<OwnedImage>> outputs;
+    std::unique_ptr<ComputePass> mirror_rgba_pass, mirror_r32_pass, mirror_rg16_pass, meter_pass;
     std::unique_ptr<ComputePass> motion_pass, composite_pass, composite_hdr_pass, linearize_pass,
         sharpen_pass, hudless_dim_pass;
     vk::UniqueSampler nearest, linear;
@@ -502,6 +517,16 @@ struct BbTemporalDlss::Impl {
                 next.dump_frames = u32(std::clamp(number, 1, 60));
             else if (key == "dump_output")
                 next.dump_output = number != 0;
+            else if (key == "exp_mirror")
+                next.exp_mirror = std::clamp(number, 0, 3);
+            else if (key == "exp_reset")
+                next.exp_reset = number != 0;
+            else if (key == "exp_mv_x")
+                next.exp_mv_x = std::clamp(float(std::atof(value.c_str())), -4.f, 4.f);
+            else if (key == "exp_mv_y")
+                next.exp_mv_y = std::clamp(float(std::atof(value.c_str())), -4.f, 4.f);
+            else if (key == "meter")
+                next.meter = number != 0;
             else if (key == "upscaler")
                 next.upscaler = value.starts_with("dlss")   ? 1
                                 : value.starts_with("fsr4") ? 3
@@ -547,7 +572,7 @@ struct BbTemporalDlss::Impl {
             T::eCombinedImageSampler, T::eCombinedImageSampler, T::eCombinedImageSampler,
             T::eCombinedImageSampler, T::eStorageImage,         T::eCombinedImageSampler,
             T::eStorageBuffer,        T::eStorageBuffer};
-        motion_pass = std::make_unique<ComputePass>(device, motion_types, BB_DLSS_MOTION_COMP, 96);
+        motion_pass = std::make_unique<ComputePass>(device, motion_types, BB_DLSS_MOTION_COMP, 104);
         composite_pass =
             std::make_unique<ComputePass>(device, composite_types, BB_DLSS_COMPOSITE_COMP, 8);
         composite_hdr_pass =
@@ -562,6 +587,15 @@ struct BbTemporalDlss::Impl {
                                                       T::eStorageBuffer};
         hudless_dim_pass =
             std::make_unique<ComputePass>(device, hudless_dim_types, BB_HUDLESS_DIM_COMP, 4);
+        mirror_rgba_pass =
+            std::make_unique<ComputePass>(device, linearize_types, BB_DLSS_MIRROR_RGBA16F_COMP, 20);
+        mirror_r32_pass =
+            std::make_unique<ComputePass>(device, linearize_types, BB_DLSS_MIRROR_R32F_COMP, 20);
+        mirror_rg16_pass =
+            std::make_unique<ComputePass>(device, linearize_types, BB_DLSS_MIRROR_RG16F_COMP, 20);
+        static constexpr std::array meter_types{T::eCombinedImageSampler, T::eCombinedImageSampler,
+                                                T::eCombinedImageSampler, T::eStorageBuffer};
+        meter_pass = std::make_unique<ComputePass>(device, meter_types, BB_FLICKER_METER_COMP, 20);
         const auto sampler = [&](vk::Filter filter) {
             return Make(device.createSamplerUnique(vk::SamplerCreateInfo{
                             .magFilter = filter,
@@ -1037,6 +1071,270 @@ struct BbTemporalDlss::Impl {
                   "composite");
     }
 
+    // Diagnostic (exp_mirror): mirrored copies of the upscaler's inputs, and of its output.
+    std::unique_ptr<OwnedImage> mirror_color, mirror_depth, mirror_motion, mirror_output;
+    int mirror_mode_used{};
+
+    void MirrorInto(vk::CommandBuffer command, ComputePass& pass, vk::ImageView source,
+                    OwnedImage& target, std::array<float, 4> scale, u32 flip) {
+        target.Transit(command, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
+                       vk::AccessFlagBits2::eShaderWrite);
+        const std::array images{
+            vk::DescriptorImageInfo{*nearest, source, vk::ImageLayout::eShaderReadOnlyOptimal},
+            vk::DescriptorImageInfo{{}, *target.view, vk::ImageLayout::eGeneral}};
+        const std::array writes{
+            vk::WriteDescriptorSet{.dstBinding = 0,
+                                   .descriptorCount = 1,
+                                   .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                                   .pImageInfo = &images[0]},
+            vk::WriteDescriptorSet{.dstBinding = 1,
+                                   .descriptorCount = 1,
+                                   .descriptorType = vk::DescriptorType::eStorageImage,
+                                   .pImageInfo = &images[1]}};
+        struct {
+            std::array<float, 4> scale;
+            u32 flip;
+        } push{scale, flip};
+        command.bindPipeline(vk::PipelineBindPoint::eCompute, *pass.pipeline);
+        command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pass.layout, 0, writes);
+        command.pushConstants(*pass.layout, vk::ShaderStageFlagBits::eCompute, 0, 20, &push);
+        command.dispatch((target.extent.width + 7) / 8, (target.extent.height + 7) / 8, 1);
+        target.Transit(command, vk::ImageLayout::eShaderReadOnlyOptimal,
+                       vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+    }
+
+    // Diagnostic (meter): per 64x64 cell of the upscaled image, how much it changes from the
+    // previous frame once motion is taken out. Read back four frames later and logged per frame
+    // (column profile, flicker_meter.csv) and per autopilot step (whole grid, flicker_grid.csv).
+    struct MeterSlot {
+        std::unique_ptr<VideoCore::Buffer> buffer;
+        BbAutopilot::Status pilot{};
+        u64 frame{};
+        std::string key;
+        double t_ms{};
+        bool pending{};
+    };
+    std::array<MeterSlot, 4> meter_slots;
+    std::unique_ptr<VideoCore::Buffer> meter_grid;
+    std::unique_ptr<OwnedImage> meter_prev;
+    bool meter_prev_valid{};
+    u64 meter_frames{};
+    u32 meter_gw{}, meter_gh{};
+    std::ofstream meter_csv, meter_grid_csv;
+    std::vector<double> step_sum; // per cell: diff, detail, still, count, motion
+    u32 step_frames{};
+    std::string step_key;
+    const std::chrono::steady_clock::time_point meter_epoch{std::chrono::steady_clock::now()};
+
+    std::string ExperimentKey() const {
+        return fmt::format("mirror{} reset{} mv{:g},{:g} jitter{} objmotion{} sign{:g},{:g} "
+                           "preset{} camera{} snap{}",
+                           tune.exp_mirror, tune.exp_reset ? 1 : 0, tune.exp_mv_x, tune.exp_mv_y,
+                           tune.jitter ? 1 : 0, tune.mirror ? 1 : 0, tune.sign_x, tune.sign_y,
+                           tune.preset, tune.scene_camera ? 1 : 0, tune.camera_snap ? 1 : 0);
+    }
+
+    void FlushMeterStep() {
+        if (step_frames == 0 || step_sum.empty())
+            return;
+        if (!meter_grid_csv.is_open()) {
+            meter_grid_csv.open(BbDlssSettingsPath().parent_path() / "flicker_grid.csv",
+                                std::ios::app);
+            meter_grid_csv << fmt::format("# session grid {}x{} cells of 64 px; per line: key, "
+                                          "frames, then diff per cell, detail per cell, motion "
+                                          "per cell (row major; diff/detail x1000, motion px)\n",
+                                          meter_gw, meter_gh);
+        }
+        std::string line = fmt::format("{};{}", step_key, step_frames);
+        const size_t cells = size_t(meter_gw) * meter_gh;
+        for (int field : {0, 1, 4}) {
+            line += ";";
+            for (size_t c = 0; c < cells; ++c) {
+                const double count = step_sum[c * 5 + 3];
+                const double v = count > 0 ? step_sum[c * 5 + field] / count : 0.0;
+                line += fmt::format("{}{:.2f}", c ? "," : "",
+                                    field == 4 ? v / 64.0 : v * 1000.0 / 4096.0);
+            }
+        }
+        meter_grid_csv << line << '\n';
+        meter_grid_csv.flush();
+        std::fill(step_sum.begin(), step_sum.end(), 0.0);
+        step_frames = 0;
+    }
+
+    void ConsumeMeter(MeterSlot& slot) {
+        const size_t cells = size_t(meter_gw) * meter_gh;
+        const u64 bytes = cells * 5 * sizeof(u32);
+        slot.buffer->Invalidate(0, bytes);
+        std::vector<u32> grid(cells * 5);
+        std::memcpy(grid.data(), slot.buffer->mapped_data.data(), bytes);
+        if (!meter_csv.is_open()) {
+            meter_csv.open(BbDlssSettingsPath().parent_path() / "flicker_meter.csv", std::ios::app);
+            meter_csv << fmt::format("# session {} columns of 64 px; t_ms;frame;run;step;active;key;"
+                                     "pixels;motion_px;diff per column x1000;detail per column "
+                                     "x1000;still per column x1000\n",
+                                     meter_gw);
+        }
+        std::vector<double> col(size_t(meter_gw) * 5, 0.0);
+        double total = 0, motion = 0;
+        for (u32 y = 0; y < meter_gh; ++y)
+            for (u32 x = 0; x < meter_gw; ++x)
+                for (int f = 0; f < 5; ++f)
+                    col[x * 5 + f] += grid[(size_t(y) * meter_gw + x) * 5 + f];
+        for (u32 x = 0; x < meter_gw; ++x) {
+            total += col[x * 5 + 3];
+            motion += col[x * 5 + 4];
+        }
+        std::string line = fmt::format("{:.1f};{};{};{};{};{};{:.0f};{:.2f}", slot.t_ms, slot.frame,
+                                       slot.pilot.run, slot.pilot.step, slot.pilot.active ? 1 : 0,
+                                       slot.key, total, total > 0 ? motion / total / 64.0 : 0.0);
+        for (int field : {0, 1, 2}) {
+            line += ";";
+            for (u32 x = 0; x < meter_gw; ++x) {
+                const double count = col[x * 5 + 3];
+                line += fmt::format("{}{:.2f}", x ? "," : "",
+                                    count > 0 ? col[x * 5 + field] / count * 1000.0 / 4096.0 : 0.0);
+            }
+        }
+        meter_csv << line << '\n';
+        if (slot.frame % 45 == 0)
+            meter_csv.flush();
+        // Whole-grid sums per autopilot step and experiment.
+        const std::string key = fmt::format("run{} step{} active{} {}", slot.pilot.run,
+                                            slot.pilot.step, slot.pilot.active ? 1 : 0, slot.key);
+        if (key != step_key) {
+            FlushMeterStep();
+            step_key = key;
+        }
+        if (step_sum.size() != cells * 5)
+            step_sum.assign(cells * 5, 0.0);
+        for (size_t i = 0; i < cells * 5; ++i)
+            step_sum[i] += grid[i];
+        ++step_frames;
+    }
+
+    void RunMeter(const Instance& instance, vk::CommandBuffer command, vk::Extent2D in,
+                  vk::Extent2D out) {
+        const u32 gw = (out.width + 63) / 64, gh = (out.height + 63) / 64;
+        const u64 bytes = u64(gw) * gh * 5 * sizeof(u32);
+        if (!meter_grid || gw != meter_gw || gh != meter_gh) {
+            FlushMeterStep();
+            meter_grid = std::make_unique<VideoCore::Buffer>(
+                instance, 0, bytes, VideoCore::MemoryType::DeviceLocal, "flicker meter");
+            for (auto& slot : meter_slots) {
+                slot.buffer = std::make_unique<VideoCore::Buffer>(
+                    instance, 0, bytes, VideoCore::MemoryType::HostCached, "flicker meter readback");
+                slot.pending = false;
+            }
+            meter_gw = gw;
+            meter_gh = gh;
+            step_sum.clear();
+        }
+        if (!meter_prev || meter_prev->extent != out) {
+            using U = vk::ImageUsageFlagBits;
+            meter_prev = std::make_unique<OwnedImage>(instance, vk::Format::eR16G16B16A16Sfloat, out,
+                                                      U::eSampled | U::eTransferDst);
+            meter_prev_valid = false;
+        }
+        auto& slot = meter_slots[meter_frames % meter_slots.size()];
+        if (slot.pending) {
+            ConsumeMeter(slot);
+            slot.pending = false;
+        }
+        const auto buffer_barrier = [&](vk::Buffer buffer, vk::PipelineStageFlags2 src_stage,
+                                        vk::AccessFlags2 src, vk::PipelineStageFlags2 dst_stage,
+                                        vk::AccessFlags2 dst) {
+            const vk::BufferMemoryBarrier2 barrier{.srcStageMask = src_stage,
+                                                   .srcAccessMask = src,
+                                                   .dstStageMask = dst_stage,
+                                                   .dstAccessMask = dst,
+                                                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                                   .buffer = buffer,
+                                                   .offset = 0,
+                                                   .size = VK_WHOLE_SIZE};
+            command.pipelineBarrier2(
+                vk::DependencyInfo{.bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &barrier});
+        };
+        buffer_barrier(meter_grid->Handle(), vk::PipelineStageFlagBits2::eAllCommands,
+                       vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                       vk::PipelineStageFlagBits2::eClear, vk::AccessFlagBits2::eTransferWrite);
+        command.fillBuffer(meter_grid->Handle(), 0, bytes, 0);
+        buffer_barrier(meter_grid->Handle(), vk::PipelineStageFlagBits2::eClear,
+                       vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eComputeShader,
+                       vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+        const auto upscaled_layout = upscaled->layout;
+        upscaled->Transit(command, vk::ImageLayout::eShaderReadOnlyOptimal,
+                          vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead);
+        meter_prev->Transit(command, vk::ImageLayout::eShaderReadOnlyOptimal,
+                            vk::PipelineStageFlagBits2::eComputeShader,
+                            vk::AccessFlagBits2::eShaderRead);
+        const std::array images{
+            vk::DescriptorImageInfo{*nearest, *upscaled->view, vk::ImageLayout::eShaderReadOnlyOptimal},
+            vk::DescriptorImageInfo{*linear, *meter_prev->view,
+                                    vk::ImageLayout::eShaderReadOnlyOptimal},
+            vk::DescriptorImageInfo{*nearest, *motion->view, vk::ImageLayout::eShaderReadOnlyOptimal}};
+        const vk::DescriptorBufferInfo grid_info{meter_grid->Handle(), 0, bytes};
+        std::array<vk::WriteDescriptorSet, 4> writes;
+        for (u32 i = 0; i < 3; ++i)
+            writes[i] = {.dstBinding = i,
+                         .descriptorCount = 1,
+                         .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+                         .pImageInfo = &images[i]};
+        writes[3] = {.dstBinding = 3,
+                     .descriptorCount = 1,
+                     .descriptorType = vk::DescriptorType::eStorageBuffer,
+                     .pBufferInfo = &grid_info};
+        // The motion image holds exp_mv-scaled vectors: undo that to follow the real motion.
+        const auto unscale = [](float s) { return std::abs(s) > 1e-3f ? 1.0f / s : 0.0f; };
+        struct {
+            float mv_scale[2];
+            u32 grid_w, grid_h, have_previous;
+        } push{{float(out.width) / float(in.width) * unscale(tune.exp_mv_x),
+                float(out.height) / float(in.height) * unscale(tune.exp_mv_y)},
+               gw,
+               gh,
+               meter_prev_valid ? 1u : 0u};
+        command.bindPipeline(vk::PipelineBindPoint::eCompute, *meter_pass->pipeline);
+        command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *meter_pass->layout, 0, writes);
+        command.pushConstants(*meter_pass->layout, vk::ShaderStageFlagBits::eCompute, 0, 20, &push);
+        command.dispatch((out.width + 7) / 8, (out.height + 7) / 8, 1);
+        buffer_barrier(meter_grid->Handle(), vk::PipelineStageFlagBits2::eComputeShader,
+                       vk::AccessFlagBits2::eShaderWrite, vk::PipelineStageFlagBits2::eCopy,
+                       vk::AccessFlagBits2::eTransferRead);
+        const vk::BufferCopy copy{.srcOffset = 0, .dstOffset = 0, .size = bytes};
+        command.copyBuffer(meter_grid->Handle(), slot.buffer->Handle(), copy);
+        buffer_barrier(slot.buffer->Handle(), vk::PipelineStageFlagBits2::eCopy,
+                       vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eHost,
+                       vk::AccessFlagBits2::eHostRead);
+        slot.pilot = BbAutopilot::GetStatus();
+        slot.frame = frame;
+        slot.key = ExperimentKey();
+        slot.t_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                              meter_epoch)
+                        .count();
+        slot.pending = meter_prev_valid;
+        // This frame becomes the next frame's previous one.
+        upscaled->Transit(command, vk::ImageLayout::eTransferSrcOptimal,
+                          vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferRead);
+        meter_prev->Transit(command, vk::ImageLayout::eTransferDstOptimal,
+                            vk::PipelineStageFlagBits2::eCopy, vk::AccessFlagBits2::eTransferWrite);
+        const vk::ImageCopy region{
+            .srcSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
+            .dstSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
+            .extent = {out.width, out.height, 1}};
+        command.copyImage(upscaled->image.image, vk::ImageLayout::eTransferSrcOptimal,
+                          meter_prev->image.image, vk::ImageLayout::eTransferDstOptimal, region);
+        meter_prev->Transit(command, vk::ImageLayout::eShaderReadOnlyOptimal,
+                            vk::PipelineStageFlagBits2::eComputeShader,
+                            vk::AccessFlagBits2::eShaderRead);
+        if (upscaled_layout != vk::ImageLayout::eUndefined)
+            upscaled->Transit(command, upscaled_layout, vk::PipelineStageFlagBits2::eAllCommands,
+                              vk::AccessFlagBits2::eMemoryRead);
+        meter_prev_valid = true;
+        ++meter_frames;
+    }
+
     void InvalidateOutputs() {
         for (auto& [_, image] : outputs)
             image->fresh = false;
@@ -1452,6 +1750,7 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
             float proj[4], prev_proj[4];
             float jitter[2];
             u32 use_mirror, flags;
+            float mv_scale[2];
         } push{};
         const bool scene_camera =
             tune.scene_camera && frame_has_camera && camera.valid && previous_camera.valid;
@@ -1475,6 +1774,8 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
         push.jitter[1] = applied[1];
         push.use_mirror = use_mirror ? 1u : 0u;
         push.flags = (tune.camera_snap ? 1u : 0u) | (scene_camera ? 2u : 0u);
+        push.mv_scale[0] = tune.exp_mv_x;
+        push.mv_scale[1] = tune.exp_mv_y;
         std::memcpy(motion_constants.data(), &push, sizeof(motion_constants));
         motion_flags = push.flags | (push.use_mirror << 8);
         command.bindPipeline(vk::PipelineBindPoint::eCompute, *motion_pass->pipeline);
@@ -1535,21 +1836,66 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
     upscaled_tone_mapped = renodx;
     const DlssNgx::Resource depth_resource{depth->backing->image.image, *depth_view.image_view,
                                            Range, vk::Format::eR32Sfloat, in};
-    const bool reset = !history_valid;
-    const DlssNgx::EvalDesc eval{(tune.swap ? applied[1] : applied[0]) * tune.sign_x,
-                                 (tune.swap ? applied[0] : applied[1]) * tune.sign_y, reset,
-                                 frame_ms};
+    // Diagnostic: the upscaler sees a mirrored world (and its output is mirrored back).
+    const u32 flip = u32(tune.exp_mirror);
+    if (int(flip) != mirror_mode_used) {
+        history_valid = false;
+        mirror_mode_used = int(flip);
+        LOG_INFO(Render_Vulkan, "[DLSS-EXP] Mirror mode {}", flip);
+    }
+    const bool reset = !history_valid || tune.exp_reset;
+    float jitter_x = (tune.swap ? applied[1] : applied[0]) * tune.sign_x;
+    float jitter_y = (tune.swap ? applied[0] : applied[1]) * tune.sign_y;
+    auto color_input = (linear ? linear_color : snapshot)->Resource();
+    auto depth_input = depth_resource;
+    auto motion_input = motion->Resource();
+    auto output_target = upscaled->Resource();
+    if (flip != 0) {
+        using U = vk::ImageUsageFlagBits;
+        const auto make = [&](std::unique_ptr<OwnedImage>& image, vk::Format format,
+                              vk::Extent2D size) {
+            if (!image || image->extent != size)
+                image = std::make_unique<OwnedImage>(instance, format, size,
+                                                     U::eSampled | U::eStorage);
+        };
+        make(mirror_color, vk::Format::eR16G16B16A16Sfloat, in);
+        make(mirror_depth, vk::Format::eR32Sfloat, in);
+        make(mirror_motion, vk::Format::eR16G16Sfloat, in);
+        make(mirror_output, vk::Format::eR16G16B16A16Sfloat, out);
+        const float sx = (flip & 1u) ? -1.f : 1.f, sy = (flip & 2u) ? -1.f : 1.f;
+        MirrorInto(command, *mirror_rgba_pass, color_input.view, *mirror_color, {1, 1, 1, 1}, flip);
+        MirrorInto(command, *mirror_r32_pass, *depth_view.image_view, *mirror_depth, {1, 1, 1, 1},
+                   flip);
+        MirrorInto(command, *mirror_rg16_pass, *motion->view, *mirror_motion, {sx, sy, 1, 1}, flip);
+        mirror_output->Transit(command, vk::ImageLayout::eGeneral,
+                               vk::PipelineStageFlagBits2::eComputeShader,
+                               vk::AccessFlagBits2::eShaderWrite);
+        color_input = mirror_color->Resource();
+        depth_input = mirror_depth->Resource();
+        motion_input = mirror_motion->Resource();
+        output_target = mirror_output->Resource();
+        jitter_x *= sx;
+        jitter_y *= sy;
+    }
+    const DlssNgx::EvalDesc eval{jitter_x, jitter_y, reset, frame_ms};
     const bool success =
         backend == Backend::Dlss
-            ? ngx->Evaluate(command, (linear ? linear_color : snapshot)->Resource(), depth_resource,
-                            motion->Resource(), upscaled->Resource(), eval)
+            ? ngx->Evaluate(command, color_input, depth_input, motion_input, output_target, eval)
         : backend == Backend::Fsr4
-            ? fsr4->Evaluate(command, (linear ? linear_color : snapshot)->Resource(),
-                             depth_resource, motion->Resource(), upscaled->Resource(), eval,
+            ? fsr4->Evaluate(command, color_input, depth_input, motion_input, output_target, eval,
                              FsrCamera(), hdr ? (tune.auto_exposure ? 1 : 2) : 0)
-            : fsr->Evaluate(command, (linear ? linear_color : snapshot)->Resource(), depth_resource,
-                            motion->Resource(), upscaled->Resource(), eval, FsrCamera());
+            : fsr->Evaluate(command, color_input, depth_input, motion_input, output_target, eval,
+                            FsrCamera());
     scheduler.GetDynamicState().Invalidate(); // the upscaler records its own Vulkan state
+    if (success && flip != 0) {
+        mirror_output->Transit(command, vk::ImageLayout::eShaderReadOnlyOptimal,
+                               vk::PipelineStageFlagBits2::eComputeShader,
+                               vk::AccessFlagBits2::eShaderRead);
+        MirrorInto(command, *mirror_rgba_pass, *mirror_output->view, *upscaled, {1, 1, 1, 1}, flip);
+        upscaled->Transit(command, vk::ImageLayout::eGeneral,
+                          vk::PipelineStageFlagBits2::eComputeShader,
+                          vk::AccessFlagBits2::eShaderWrite);
+    }
     if (!success) {
         (upscale_to ? decoupled_unsupported : failed) = true;
         LOG_ERROR(Render_Vulkan, "[DLSS-TEMPORAL] Evaluation failed; stock rendering");
@@ -1597,6 +1943,17 @@ bool BbTemporalDlss::Impl::RunDlss(const Instance& instance, Runtime& runtime, S
                           vk::PipelineStageFlagBits2::eComputeShader,
                           vk::AccessFlagBits2::eShaderRead);
         dlss_ready = true;
+    }
+    if (tune.meter) {
+        try {
+            RunMeter(instance, command, in, out);
+        } catch (const std::exception& e) {
+            tune.meter = false;
+            LOG_ERROR(Render_Vulkan, "[DLSS-METER] Stopped: {}", e.what());
+        }
+    } else if (meter_csv.is_open()) {
+        FlushMeterStep();
+        meter_csv.flush();
     }
     CaptureFrameGen(instance, runtime, scheduler, command, *depth, in, eval);
     if (dump_left > 0) {

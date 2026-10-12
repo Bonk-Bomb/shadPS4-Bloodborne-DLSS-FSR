@@ -9,6 +9,7 @@
 #include "core/libraries/pad/pad_errors.h"
 #include "core/user_settings.h"
 #include "imgui/renderer/imgui_core.h"
+#include "input/bb_autopilot.h"
 #include "input/controller.h"
 #include "pad.h"
 
@@ -150,6 +151,10 @@ int PS4_SYSV_ABI scePadGetControllerInformation(s32 handle, OrbisPadControllerIn
     pInfo->connectedCount = state.connected_count;
     pInfo->deviceClass = OrbisPadDeviceClass::Standard;
     pInfo->connected = state.connected;
+    if (!state.connected && BbAutopilot::KeepConnected()) {
+        pInfo->connected = true;
+        pInfo->connectedCount = std::max<u8>(pInfo->connectedCount, 1);
+    }
     if (state.connected) {
         pInfo->deviceClass = EmulatorSettings.IsUsingSpecialPad()
                                  ? (OrbisPadDeviceClass)EmulatorSettings.GetSpecialPadClass()
@@ -370,6 +375,15 @@ int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
         pData[0] = {};
         pData[0].orientation = {0.0f, 0.0f, 0.0f, 1.0f};
         pData[0].connected = false;
+        if (BbAutopilot::KeepConnected()) {
+            // Unattended testing: the real controller went to sleep; keep a neutral one.
+            pData[0].leftStick = {128, 128};
+            pData[0].rightStick = {128, 128};
+            pData[0].connected = true;
+            pData[0].connectedCount = 1;
+            pData[0].timestamp = states[0].time;
+            BbAutopilot::Apply(pData[0]);
+        }
         return 1;
     }
 
@@ -424,6 +438,7 @@ int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
         pData[i].timestamp = states[i].time;
         pData[i].connectedCount = states[i].connected_count;
         pData[i].deviceUniqueDataLen = 0;
+        BbAutopilot::Apply(pData[i]);
     }
 
     return num;
