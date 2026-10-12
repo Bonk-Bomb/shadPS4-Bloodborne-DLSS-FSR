@@ -17,7 +17,8 @@ layout(push_constant) uniform Push {
     vec4 prev_proj;    // previous projection
     vec2 jitter;       // viewport offset of this frame's scene draws, render pixels (y down)
     uint use_mirror;   // object velocity covered pixels override camera motion
-    uint flags;        // 1: snap matrix rounding noise, 2: scene camera matrices valid
+    uint flags;        // 1: snap matrix rounding noise, 2: scene camera matrices valid,
+                       // 4: view space y points down (the game's convention)
     vec2 mv_scale;     // diagnostic multiplier on the result (1, 1 normally)
     uint err_grid_w;   // cells per row of MotionError
     uint err_enabled;
@@ -77,10 +78,13 @@ void main() {
         bool sky = raw_depth >= 1.0;
         float z = sky ? 1.0 : pc.proj.w / min(raw_depth - pc.proj.z, -1e-8);
         vec2 ndc = vec2(2*uv.x-1, 1-2*uv.y);
-        vec4 view = vec4(ndc.x * z / pc.proj.x, ndc.y * z / pc.proj.y, z, sky ? 0.0 : 1.0);
+        // The game's view space has y down while NDC has it up.
+        float y_sign = (pc.flags & 4u) != 0 ? -1.0 : 1.0;
+        vec4 view = vec4(ndc.x * z / pc.proj.x, y_sign * ndc.y * z / pc.proj.y, z,
+                         sky ? 0.0 : 1.0);
         vec3 prev_view = vec3(dot(pc.reproject[0], view), dot(pc.reproject[1], view),
                               dot(pc.reproject[2], view));
-        vec2 prev_ndc = vec2(prev_view.x * pc.prev_proj.x, prev_view.y * pc.prev_proj.y) /
+        vec2 prev_ndc = vec2(prev_view.x * pc.prev_proj.x, y_sign * prev_view.y * pc.prev_proj.y) /
                         max(prev_view.z, 1e-4);
         vec2 prev_uv = vec2(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
         const vec2 scene_delta = (prev_uv - uv) * vec2(extent);
