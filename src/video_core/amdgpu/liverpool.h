@@ -9,6 +9,7 @@
 #include <mutex>
 #include <semaphore>
 #include <span>
+#include <string_view>
 #include <thread>
 #include <vector>
 #include <queue>
@@ -120,7 +121,9 @@ public:
     void ReserveCopyBufferSpace() {
         GpuQueue& gfx_queue = mapped_queues[GfxQueueId];
         std::scoped_lock lk(gfx_queue.m_access);
-        constexpr size_t GfxReservedSize = 2_MB >> 2;
+        // A frame's worth of command buffers. CopyCmdBuffers falls back to the game's own memory
+        // if a frame ever needs more, instead of asserting.
+        constexpr size_t GfxReservedSize = 16_MB >> 2;
         gfx_queue.ccb_buffer.reserve(GfxReservedSize);
         gfx_queue.dcb_buffer.reserve(GfxReservedSize);
     }
@@ -186,6 +189,10 @@ private:
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
     Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb);
+    // A graphics command buffer that cannot be parsed (unknown packet, packet running past the
+    // end of its buffer). Logs where it is and what surrounds it; the caller drops the rest of
+    // that buffer instead of taking the whole emulator down.
+    void ReportBadPacket(std::string_view what, std::span<const u32> whole, const u32* at);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
@@ -204,6 +211,11 @@ private:
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
     u32 num_mapped_queues{1u}; // GFX is always available
+
+    // Nesting depth of indirect buffers in the graphics parser, and how many bad packets were
+    // reported (the report is detailed, so only the first few are logged). GPU thread only.
+    u32 gfx_ib_depth{};
+    u32 bad_packet_reports{};
 
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};

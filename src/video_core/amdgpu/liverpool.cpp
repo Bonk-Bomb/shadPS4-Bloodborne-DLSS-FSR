@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <string>
 #include <boost/preprocessor/stringize.hpp>
+#include <fmt/format.h>
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -234,6 +237,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+    const std::span<const u32> whole_dcb = dcb;
     while (!dcb.empty()) {
         ProcessCommands();
 
@@ -242,12 +246,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
         switch (type) {
         default:
-            UNREACHABLE_MSG("Wrong PM4 type {}", type);
-            break;
+            ReportBadPacket(fmt::format("wrong PM4 type {}", type), whole_dcb, dcb.data());
+            dcb = {};
+            continue;
         case 0:
-            UNREACHABLE_MSG("Unimplemented PM4 type 0, base reg: {}, size: {}",
-                            header->type0.base.Value(), header->type0.NumWords());
-            break;
+            ReportBadPacket(fmt::format("unimplemented PM4 type 0, base reg {}, size {}",
+                                        header->type0.base.Value(), header->type0.NumWords()),
+                            whole_dcb, dcb.data());
+            dcb = {};
+            continue;
         case 2:
             // Type-2 packet are used for padding purposes
             dcb = NextPacket(dcb, 1);
@@ -255,6 +262,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            if (count + 1 > dcb.size()) {
+                ReportBadPacket(fmt::format("opcode {:#x} needs {} dwords, buffer has {} left",
+                                            static_cast<u32>(opcode), count + 1, dcb.size()),
+                                whole_dcb, dcb.data());
+                dcb = {};
+                continue;
+            }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -795,12 +809,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
                 auto task = ProcessGraphics(
                     {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                ++gfx_ib_depth;
                 RESUME_GFX(task);
 
                 while (!task.handle.done()) {
                     YIELD_GFX();
                     RESUME_GFX(task);
                 }
+                --gfx_ib_depth;
                 break;
             }
             case PM4ItOpcode::IncrementDeCounter: {
@@ -844,8 +860,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             default:
-                UNREACHABLE_MSG("Unknown PM4 type 3 opcode {:#x} with count {}",
-                                static_cast<u32>(opcode), count);
+                ReportBadPacket(fmt::format("unknown PM4 type 3 opcode {:#x} with count {}",
+                                            static_cast<u32>(opcode), count),
+                                whole_dcb, dcb.data());
+                dcb = {};
+                continue;
             }
             dcb = NextPacket(dcb, header->type3.NumWords() + 1);
             break;
@@ -860,6 +879,54 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
 
     FIBER_EXIT;
+}
+
+void Liverpool::ReportBadPacket(std::string_view what, std::span<const u32> whole, const u32* at) {
+    // Every later bad packet is still dropped the same way; only the detail is rate-limited.
+    constexpr u32 MaxDetailedReports = 8;
+    const size_t offset = static_cast<size_t>(at - whole.data());
+    if (bad_packet_reports++ >= MaxDetailedReports) {
+        LOG_ERROR(Lib_GnmDriver, "[PM4-GUARD] {} at dword {} of {}; dropped the rest of the buffer",
+                  what, offset, whole.size());
+        return;
+    }
+
+    const auto base = reinterpret_cast<uintptr_t>(whole.data());
+    const auto& gfx = mapped_queues[GfxQueueId];
+    const auto in_copy = [&](const std::vector<u32>& buffer) {
+        const auto start = reinterpret_cast<uintptr_t>(buffer.data());
+        return base >= start && base < start + buffer.capacity() * sizeof(u32);
+    };
+    const bool copied = in_copy(gfx.dcb_buffer) || in_copy(gfx.ccb_buffer);
+
+    // Guest memory only: the tracker covers the 40-bit guest range, not host allocations.
+    std::string tracked = "not guest memory";
+    const u64 bytes = whole.size_bytes();
+    if (!copied && base + bytes <= (1ULL << 40) && rasterizer) {
+        auto& buffer_cache = rasterizer->GetBufferCache();
+        tracked =
+            fmt::format("GPU-written {}, CPU-written {}", buffer_cache.IsRegionGpuModified(base, bytes),
+                        buffer_cache.IsRegionCpuModified(base, bytes));
+    }
+
+    // The dwords around the bad packet: a half-overwritten buffer and a parser that lost its
+    // place look different here.
+    std::string dump;
+    const size_t from = offset > 8 ? offset - 8 : 0;
+    const size_t to = std::min(whole.size(), offset + 9);
+    for (size_t i = from; i < to; ++i) {
+        if (i == offset) {
+            dump += fmt::format("[{:08x}] ", whole[i]);
+        } else {
+            dump += fmt::format("{:08x} ", whole[i]);
+        }
+    }
+
+    LOG_CRITICAL(Lib_GnmDriver,
+                 "[PM4-GUARD] {} at dword {} of {} in {} buffer {:#x} (indirect depth {}, {}); "
+                 "dropped the rest of the buffer instead of stopping. Around it: {}",
+                 what, offset, whole.size(), copied ? "copied" : "game", base, gfx_ib_depth,
+                 tracked, dump);
 }
 
 template <bool is_indirect>
@@ -1133,10 +1200,20 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
 Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
-    ASSERT_MSG(queue.dcb_buffer.capacity() >= queue.dcb_buffer_offset + dcb.size(),
-               "dcb copy buffer out of reserved space");
-    ASSERT_MSG(queue.ccb_buffer.capacity() >= queue.ccb_buffer_offset + ccb.size(),
-               "ccb copy buffer out of reserved space");
+    // Growing past the reservation would move the buffer under submissions that are still
+    // queued, so a frame that does not fit runs from the game's memory as it would uncopied.
+    if (queue.dcb_buffer.capacity() < queue.dcb_buffer_offset + dcb.size() ||
+        queue.ccb_buffer.capacity() < queue.ccb_buffer_offset + ccb.size()) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LOG_WARNING(Lib_GnmDriver,
+                        "Command buffer copy space full ({} + {} dwords); this submission is "
+                        "not copied",
+                        queue.dcb_buffer_offset.load(), dcb.size());
+        }
+        return std::make_pair(dcb, ccb);
+    }
 
     queue.dcb_buffer.resize(
         std::max(queue.dcb_buffer.size(), queue.dcb_buffer_offset + dcb.size()));
