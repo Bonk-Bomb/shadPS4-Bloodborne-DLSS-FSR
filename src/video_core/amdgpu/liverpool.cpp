@@ -1200,8 +1200,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
 Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
-    // Copies are rewound to the start of the space only when no queued submission can still
-    // read them. Rewinding at sceGnmSubmitDone overwrote the last submissions of a frame that
+    // Copies are rewound to the start of the space only when no queued graphics submission can
+    // still read them. Rewinding at sceGnmSubmitDone overwrote the last submissions of a frame that
     // the GPU thread had not reached yet whenever the game got its next frame in first (the
     // GPU-idle signal can clear the submission lock just after newer work was queued), which
     // showed up as packets cut at buffer boundaries and buffers starting mid-packet.
@@ -1209,7 +1209,12 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
         return queue.dcb_buffer.capacity() >= queue.dcb_buffer_offset + dcb.size() &&
                queue.ccb_buffer.capacity() >= queue.ccb_buffer_offset + ccb.size();
     };
-    if (IsGpuIdle()) {
+    bool gfx_idle;
+    {
+        std::scoped_lock lock{queue.m_access};
+        gfx_idle = queue.submits.empty(); // tasks leave the queue once they are done
+    }
+    if (gfx_idle) {
         queue.dcb_buffer_offset = 0;
         queue.ccb_buffer_offset = 0;
     }
