@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
-
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
@@ -2175,37 +2173,6 @@ static inline s32 PatchFlipRequest(u32* cmdbuf, u32 size, u32 vo_handle, u32 buf
     return ORBIS_OK;
 }
 
-// Bloodborne sometimes ends a draw command buffer one or two dwords into a packet and carries on
-// with the rest of that packet at the start of the next buffer, which follows it in memory (seen
-// at the DB_SHADER_CONTROL write of a pixel shader setup, at bosses, menus and loading screens).
-// Read as two separate buffers, the first ends in a cut packet and the second starts with its
-// tail, which is not a packet at all. Such a pair is read as the one stream it is: the first
-// buffer takes the rest of the packet from the memory after it, and when the next buffer starts
-// there, the dwords already used are skipped. Guarded by m_submit_lock like the submits.
-static const u32* dcb_continuation_at{};
-static u32 dcb_continuation_dwords{};
-static u64 dcb_stitches{};
-
-// How many dwords the last packet of a command buffer reaches past its end (0 if it ends on a
-// packet boundary or holds packets that can't be walked).
-static u32 DcbPacketOverrun(const u32* dcb, u32 size_dw) {
-    u32 pos = 0;
-    while (pos < size_dw) {
-        const u32 header = dcb[pos];
-        switch (header >> 30) {
-        case 3:
-            pos += ((header >> 16) & 0x3fffu) + 2;
-            break;
-        case 2:
-            pos += 1;
-            break;
-        default:
-            return 0;
-        }
-    }
-    return pos - size_dw;
-}
-
 static inline s32 PerformSubmit(u32 count, const u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes,
                                 const u32* ccb_gpu_addrs[], u32* ccb_sizes_in_bytes) {
     if (DebugState.ShouldPauseInSubmit()) {
@@ -2243,33 +2210,10 @@ static inline s32 PerformSubmit(u32 count, const u32* dcb_gpu_addrs[], u32* dcb_
         const auto* ccb = ccb_gpu_addrs ? ccb_gpu_addrs[cbpair] : nullptr;
         const auto ccb_size_in_bytes = ccb_sizes_in_bytes ? ccb_sizes_in_bytes[cbpair] : 0;
 
-        const u32* dcb_addr = dcb_gpu_addrs[cbpair];
-        u32 dcb_size_dw = dcb_sizes_in_bytes[cbpair] >> 2;
+        const auto dcb_size_dw = dcb_sizes_in_bytes[cbpair] >> 2;
         const auto ccb_size_dw = ccb_size_in_bytes >> 2;
 
-        // The tail of a packet the previous buffer already finished.
-        if (dcb_continuation_dwords != 0 && dcb_addr == dcb_continuation_at) {
-            const u32 skip = std::min(dcb_continuation_dwords, dcb_size_dw);
-            dcb_addr += skip;
-            dcb_size_dw -= skip;
-        }
-        dcb_continuation_dwords = 0;
-        // A cut packet at the end: finish it from the memory that follows (a few dwords at most;
-        // anything longer is not a cut packet but a broken buffer, left to the parser's guard).
-        const u32 overrun = DcbPacketOverrun(dcb_addr, dcb_size_dw);
-        if (overrun != 0 && overrun <= 32) {
-            dcb_continuation_at = dcb_addr + dcb_size_dw;
-            dcb_continuation_dwords = overrun;
-            dcb_size_dw += overrun;
-            if (++dcb_stitches <= 8 || dcb_stitches % 1000 == 0) {
-                LOG_WARNING(Lib_GnmDriver,
-                            "[PM4-STITCH] command buffer {} of {} ended {} dwords into a packet; "
-                            "finished it from the following buffer ({} times so far)",
-                            cbpair + 1, count, overrun, dcb_stitches);
-            }
-        }
-
-        const auto& dcb_span = std::span{dcb_addr, dcb_size_dw};
+        const auto& dcb_span = std::span{dcb_gpu_addrs[cbpair], dcb_size_dw};
         const auto& ccb_span = std::span{ccb, ccb_size_dw};
 
         if (DebugState.DumpingCurrentFrame()) {
@@ -2289,7 +2233,7 @@ static inline s32 PerformSubmit(u32 count, const u32* dcb_gpu_addrs[], u32* dcb_
                 .submit_num = seq_num,
                 .num2 = cbpair,
                 .data = {dcb_span.begin(), dcb_span.end()},
-                .base_addr = reinterpret_cast<uintptr_t>(dcb_addr),
+                .base_addr = reinterpret_cast<uintptr_t>(dcb_gpu_addrs[cbpair]),
             });
             DebugState.PushQueueDump({
                 .type = QueueType::ccb,
