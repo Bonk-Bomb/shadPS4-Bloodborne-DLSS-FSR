@@ -1,0 +1,5 @@
+sha=28bfae81b08b7f27bb9ce0136fafcdc78d42cb0b
+ref=bb-net-port-resilient
+run=https://github.com/Bonk-Bomb/shadPS4-Bloodborne-DLSS-FSR/actions/runs/38582570525
+configure=success
+build=success
