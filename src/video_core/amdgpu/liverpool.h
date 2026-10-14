@@ -73,8 +73,8 @@ public:
 
     void SubmitDone() noexcept {
         std::scoped_lock lk{submit_mutex};
-        mapped_queues[GfxQueueId].ccb_buffer_offset = 0;
-        mapped_queues[GfxQueueId].dcb_buffer_offset = 0;
+        // The command buffer copy space is not rewound here: submissions of this frame can
+        // still be queued. CopyCmdBuffers rewinds it once nothing queued can read it.
         submit_done = true;
         submit_cv.notify_one();
     }

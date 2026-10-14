@@ -1200,10 +1200,22 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
 Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
+    // Copies are rewound to the start of the space only when no queued submission can still
+    // read them. Rewinding at sceGnmSubmitDone overwrote the last submissions of a frame that
+    // the GPU thread had not reached yet whenever the game got its next frame in first (the
+    // GPU-idle signal can clear the submission lock just after newer work was queued), which
+    // showed up as packets cut at buffer boundaries and buffers starting mid-packet.
+    const auto fits = [&] {
+        return queue.dcb_buffer.capacity() >= queue.dcb_buffer_offset + dcb.size() &&
+               queue.ccb_buffer.capacity() >= queue.ccb_buffer_offset + ccb.size();
+    };
+    if (IsGpuIdle()) {
+        queue.dcb_buffer_offset = 0;
+        queue.ccb_buffer_offset = 0;
+    }
     // Growing past the reservation would move the buffer under submissions that are still
-    // queued, so a frame that does not fit runs from the game's memory as it would uncopied.
-    if (queue.dcb_buffer.capacity() < queue.dcb_buffer_offset + dcb.size() ||
-        queue.ccb_buffer.capacity() < queue.ccb_buffer_offset + ccb.size()) {
+    // queued, so a submission that does not fit runs from the game's memory as it would uncopied.
+    if (!fits()) {
         static bool warned = false;
         if (!warned) {
             warned = true;
