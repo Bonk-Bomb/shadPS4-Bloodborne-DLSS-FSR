@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <codecvt>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <string>
 #include <nlohmann/json.hpp>
@@ -14,6 +15,7 @@
 #include "core/emulator_state.h"
 #include "core/file_format/psf.h"
 #include "core/file_sys/bb_hdr_compat.h"
+#include "core/mod_manager.h"
 #include "memory_patcher.h"
 
 namespace MemoryPatcher {
@@ -130,7 +132,9 @@ std::string convertValueToHex(const std::string type, const std::string valueStr
 
 void ApplyPendingPatches();
 
-void ApplyPatchesFromXML(std::filesystem::path path) {
+// only_names: apply exactly these patches (a mod's switches), whatever their isEnabled says.
+void ApplyPatchesFromXML(std::filesystem::path path,
+                         const std::set<std::string>* only_names = nullptr) {
     pugi::xml_document doc;
     pugi::xml_parse_result result = doc.load_file(path.c_str());
 
@@ -143,7 +147,10 @@ void ApplyPatchesFromXML(std::filesystem::path path) {
              it != patchXML.children().end(); ++it) {
 
             if (std::string(it->name()) == "Metadata") {
-                if (std::string(it->attribute("isEnabled").value()) == "true") {
+                const bool wanted =
+                    only_names ? only_names->contains(it->attribute("Name").value())
+                               : std::string(it->attribute("isEnabled").value()) == "true";
+                if (wanted) {
                     std::string currentPatchName = it->attribute("Name").value();
                     std::string metadataAppVer = it->attribute("AppVer").value();
                     std::string metadataAppElf = it->attribute("AppElf").value();
@@ -272,6 +279,11 @@ void OnGameLoaded() {
                 ApplyPatchesFromXML(game_patch_file);
             }
         }
+    }
+    // Patch mods switched on in the Mods tab
+    for (const auto& [xml, names] : Core::Mods::EnabledPatches(g_game_serial)) {
+        LOG_INFO(Loader, "Applying {} patch(es) from mod file {}", names.size(), xml.string());
+        ApplyPatchesFromXML(xml, &names);
     }
     ApplyPendingPatches();
 }

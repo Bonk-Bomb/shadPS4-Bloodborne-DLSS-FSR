@@ -4,6 +4,7 @@
 // Based on imgui_impl_vulkan.cpp from Dear ImGui repository
 
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 
 #include <imgui.h>
@@ -483,6 +484,155 @@ UploadTextureData UploadTexture(const void* data, vk::Format format, u32 width, 
     CheckVkErr(info.command_buffer.end());
 
     return info;
+}
+
+bool CreateStreamingTexture(StreamingTexture& t, u32 width, u32 height) {
+    VkData* bd = GetBackendData();
+    const InitInfo& v = bd->init_info;
+    const vk::DeviceSize size = static_cast<vk::DeviceSize>(width) * height * 4;
+    t.width = width;
+    t.height = height;
+
+    vk::ImageCreateInfo image_info{
+        .imageType = vk::ImageType::e2D,
+        .format = vk::Format::eR8G8B8A8Unorm,
+        .extent{.width = width, .height = height, .depth = 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .tiling = vk::ImageTiling::eOptimal,
+        .usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
+        .sharingMode = vk::SharingMode::eExclusive,
+        .initialLayout = vk::ImageLayout::eUndefined,
+    };
+    t.image = CheckVkResult(v.device.createImage(image_info, v.allocator));
+    const auto image_req = v.device.getImageMemoryRequirements(t.image);
+    t.image_memory = CheckVkResult(v.device.allocateMemory(
+        vk::MemoryAllocateInfo{
+            .allocationSize = IM_MAX(v.min_allocation_size, image_req.size),
+            .memoryTypeIndex = FindMemoryType(vk::MemoryPropertyFlagBits::eDeviceLocal,
+                                              image_req.memoryTypeBits),
+        },
+        v.allocator));
+    CheckVkErr(v.device.bindImageMemory(t.image, t.image_memory, 0));
+    t.image_view = CheckVkResult(v.device.createImageView(
+        vk::ImageViewCreateInfo{
+            .image = t.image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = vk::Format::eR8G8B8A8Unorm,
+            .subresourceRange{
+                .aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1},
+        },
+        v.allocator));
+
+    t.staging = CheckVkResult(v.device.createBuffer(
+        vk::BufferCreateInfo{
+            .size = size,
+            .usage = vk::BufferUsageFlagBits::eTransferSrc,
+            .sharingMode = vk::SharingMode::eExclusive,
+        },
+        v.allocator));
+    const auto buffer_req = v.device.getBufferMemoryRequirements(t.staging);
+    t.staging_memory = CheckVkResult(v.device.allocateMemory(
+        vk::MemoryAllocateInfo{
+            .allocationSize = IM_MAX(v.min_allocation_size, buffer_req.size),
+            .memoryTypeIndex = FindMemoryType(vk::MemoryPropertyFlagBits::eHostVisible |
+                                                  vk::MemoryPropertyFlagBits::eHostCoherent,
+                                              buffer_req.memoryTypeBits),
+        },
+        v.allocator));
+    CheckVkErr(v.device.bindBufferMemory(t.staging, t.staging_memory, 0));
+    t.mapped = CheckVkResult(v.device.mapMemory(t.staging_memory, 0, size));
+
+    t.im_texture = AddTexture(t.image_view, vk::ImageLayout::eShaderReadOnlyOptimal);
+    return t.mapped != nullptr && t.im_texture != nullptr;
+}
+
+void UpdateStreamingTexture(StreamingTexture& t, const void* rgba) {
+    if (t.mapped == nullptr) {
+        return;
+    }
+    VkData* bd = GetBackendData();
+    const InitInfo& v = bd->init_info;
+    std::memcpy(t.mapped, rgba, static_cast<size_t>(t.width) * t.height * 4);
+
+    vk::CommandBuffer cmd;
+    {
+        std::unique_lock lk(bd->command_pool_mutex);
+        cmd = CheckVkResult(v.device.allocateCommandBuffers(vk::CommandBufferAllocateInfo{
+                                .commandPool = bd->command_pool,
+                                .commandBufferCount = 1,
+                            }))
+                  .front();
+    }
+    CheckVkErr(cmd.begin(vk::CommandBufferBeginInfo{
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    }));
+    const vk::ImageSubresourceRange range{
+        .aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1};
+    // The old contents are replaced entirely, so the previous layout can be discarded; the source
+    // stage waits for earlier frames that sampled the image.
+    vk::ImageMemoryBarrier to_copy{
+        .srcAccessMask = vk::AccessFlagBits::eShaderRead,
+        .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eTransferDstOptimal,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = t.image,
+        .subresourceRange = range,
+    };
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eFragmentShader |
+                            vk::PipelineStageFlagBits::eHost,
+                        vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, {to_copy});
+    vk::BufferImageCopy region{
+        .imageSubresource{.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
+        .imageExtent{.width = t.width, .height = t.height, .depth = 1},
+    };
+    cmd.copyBufferToImage(t.staging, t.image, vk::ImageLayout::eTransferDstOptimal, {region});
+    vk::ImageMemoryBarrier to_read{
+        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+        .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+        .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = t.image,
+        .subresourceRange = range,
+    };
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                        vk::PipelineStageFlagBits::eFragmentShader, {}, {}, {}, {to_read});
+    CheckVkErr(cmd.end());
+    vk::SubmitInfo submit{.commandBufferCount = 1, .pCommandBuffers = &cmd};
+    CheckVkErr(v.queue.submit({submit}));
+    CheckVkErr(v.queue.waitIdle());
+    std::unique_lock lk(bd->command_pool_mutex);
+    v.device.freeCommandBuffers(bd->command_pool, {cmd});
+}
+
+void DestroyStreamingTexture(StreamingTexture& t) {
+    VkData* bd = GetBackendData();
+    const InitInfo& v = bd->init_info;
+    CheckVkErr(v.device.waitIdle());
+    if (t.im_texture != nullptr) {
+        RemoveTexture(t.im_texture);
+        t.im_texture = nullptr;
+    }
+    if (t.mapped != nullptr) {
+        v.device.unmapMemory(t.staging_memory);
+        t.mapped = nullptr;
+    }
+    if (t.staging) {
+        v.device.destroyBuffer(t.staging, v.allocator);
+        v.device.freeMemory(t.staging_memory, v.allocator);
+        t.staging = VK_NULL_HANDLE;
+    }
+    if (t.image) {
+        v.device.destroyImageView(t.image_view, v.allocator);
+        v.device.destroyImage(t.image, v.allocator);
+        v.device.freeMemory(t.image_memory, v.allocator);
+        t.image = VK_NULL_HANDLE;
+    }
 }
 
 void RemoveTexture(ImTextureID texture) {

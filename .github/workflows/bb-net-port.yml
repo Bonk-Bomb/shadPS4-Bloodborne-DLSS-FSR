@@ -7,6 +7,8 @@ on:
     branches:
       - "bb-net-port"
       - "bb-net-port-*"
+      - "bbsc-dlss"
+      - "bbsc-dlss-*"
   workflow_dispatch:
 
 permissions:

@@ -62,6 +62,25 @@ UploadTextureData UploadTexture(const void* data, vk::Format format, u32 width, 
 
 void RemoveTexture(ImTextureID descriptor_set);
 
+// A texture whose pixels are replaced often (the BBSC intro video): one device-local RGBA8 image,
+// one persistently mapped staging buffer. Update copies new pixels in and waits for the queue, the
+// same way UploadTextureData::Upload() does, so call it from the thread that draws ImGui.
+struct StreamingTexture {
+    vk::Image image;
+    vk::ImageView image_view;
+    vk::DeviceMemory image_memory;
+    vk::Buffer staging;
+    vk::DeviceMemory staging_memory;
+    void* mapped = nullptr;
+    ImTextureID im_texture = nullptr;
+    u32 width = 0;
+    u32 height = 0;
+};
+
+bool CreateStreamingTexture(StreamingTexture& texture, u32 width, u32 height);
+void UpdateStreamingTexture(StreamingTexture& texture, const void* rgba);
+void DestroyStreamingTexture(StreamingTexture& texture);
+
 bool Init(InitInfo info);
 void Shutdown();
 // Records the font atlas texture requests of this frame; call outside a render pass, before the

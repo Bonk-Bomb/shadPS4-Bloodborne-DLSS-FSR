@@ -12,6 +12,8 @@
 #include "core/aerolib/aerolib.h"
 #include "core/aerolib/stubs.h"
 
+#include <string_view>
+
 namespace Core::AeroLib {
 
 // Helper to provide stub implementations for missing functions
@@ -30,6 +32,12 @@ static std::mutex g_stub_mutex;
 
 static u64 PS4_SYSV_ABI CommonStub(u64 index) {
     const auto& e = g_stub_entries[index];
+    if (e.nid && std::string_view{e.nid->nid} == "Gaxrp3EWY-M") {
+        // Bloodborne submits this fire-and-forget Plus notification every frame (BBSC).
+        LOG_TRACE(Core, "Stub: {} (nid: {}) called, returning zero to {}", e.nid->name, e.nid->nid,
+                  __builtin_return_address(0));
+        return 0;
+    }
     if (e.nid) {
         LOG_ERROR(Core, "Stub: {} (nid: {}) called, returning zero to {}", e.nid->name, e.nid->nid,
                   __builtin_return_address(0));

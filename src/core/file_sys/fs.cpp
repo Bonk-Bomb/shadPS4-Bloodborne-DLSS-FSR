@@ -5,6 +5,7 @@
 #include <array>
 #include <unordered_set>
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/string_util.h"
 #include "core/file_sys/backends/host_fs.h"
 #include "core/file_sys/backends/zarchive_fs.h"
@@ -144,6 +145,98 @@ void MntPoints::Mount(const std::filesystem::path& host_folder, const std::strin
     stack.push_back(std::move(base));
 
     m_mnt_pairs.emplace_back(host_folder, guest_folder_sanitized, read_only, std::move(stack));
+}
+
+namespace {
+
+// A mod folder holding what the game keeps under `prefix` (menu\, map\... straight in the folder,
+// made to be copied into dvdroot_ps4): only paths below the prefix reach it, without the prefix.
+class PrefixBackend final : public IBackend {
+public:
+    PrefixBackend(std::shared_ptr<IBackend> inner, std::string prefix)
+        : m_inner(std::move(inner)), m_prefix(std::move(prefix)) {}
+
+    bool Exists(std::string_view rel_path) override {
+        const auto inner = Inner(rel_path);
+        return inner && m_inner->Exists(*inner);
+    }
+    bool IsDirectory(std::string_view rel_path) override {
+        const auto inner = Inner(rel_path);
+        return inner && m_inner->IsDirectory(*inner);
+    }
+    std::unique_ptr<IFile> Open(std::string_view rel_path,
+                                Common::FS::FileAccessMode mode) override {
+        const auto inner = Inner(rel_path);
+        return inner ? m_inner->Open(*inner, mode) : nullptr;
+    }
+    std::unique_ptr<IDirectory> OpenDir(std::string_view rel_path) override {
+        const auto inner = Inner(rel_path);
+        return inner ? m_inner->OpenDir(*inner) : nullptr;
+    }
+    bool IsReadOnly() const override {
+        return true;
+    }
+    std::filesystem::path RootPath() const override {
+        return m_inner->RootPath();
+    }
+    std::optional<std::vector<u8>> ReadFile(std::string_view rel_path) const override {
+        const auto inner = Inner(rel_path);
+        return inner ? m_inner->ReadFile(*inner) : std::nullopt;
+    }
+
+private:
+    std::optional<std::string> Inner(std::string_view rel) const {
+        if (rel.size() < m_prefix.size() ||
+            Common::ToLower(std::string{rel.substr(0, m_prefix.size())}) != m_prefix) {
+            return std::nullopt;
+        }
+        if (rel.size() == m_prefix.size()) {
+            return std::string{};
+        }
+        if (rel[m_prefix.size()] != '/') {
+            return std::nullopt;
+        }
+        return std::string{rel.substr(m_prefix.size() + 1)};
+    }
+
+    std::shared_ptr<IBackend> m_inner;
+    std::string m_prefix;
+};
+
+} // namespace
+
+void MntPoints::AddOverlays(std::string_view guest_folder,
+                            const std::vector<std::pair<std::filesystem::path, std::string>>& overlays) {
+    std::scoped_lock lock{m_mutex};
+    const auto guest = RemoveTrailingSlashes(std::string{guest_folder});
+    for (auto& pair : m_mnt_pairs) {
+        if (pair.mount != guest) {
+            continue;
+        }
+        std::vector<std::shared_ptr<IBackend>> layers;
+        for (const auto& [path, prefix] : overlays) {
+            std::shared_ptr<IBackend> layer;
+            if (std::filesystem::is_directory(path)) {
+                layer = std::make_shared<HostFsBackend>(path, /*ro=*/true);
+            } else if (path.extension() == ".zar" && std::filesystem::is_regular_file(path)) {
+                auto zar = std::make_shared<ZArchiveBackend>(path);
+                if (zar->IsOpen()) {
+                    layer = zar;
+                }
+            }
+            if (layer && !prefix.empty()) {
+                layer = std::make_shared<PrefixBackend>(std::move(layer), Common::ToLower(prefix));
+            }
+            if (layer) {
+                layers.push_back(std::move(layer));
+                LOG_INFO(Kernel_Fs, "Mod layer over {}{}: {}", guest,
+                         prefix.empty() ? "" : "/" + prefix, path.string());
+            } else {
+                LOG_ERROR(Kernel_Fs, "Mod layer could not be opened: {}", path.string());
+            }
+        }
+        pair.backends.insert(pair.backends.begin(), layers.begin(), layers.end());
+    }
 }
 
 void MntPoints::Unmount(const std::string& guest_folder) {

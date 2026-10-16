@@ -25,6 +25,7 @@
 #include "core/libraries/sysmodule/sysmodule_internal.h"
 #include "core/linker.h"
 #include "core/memory.h"
+#include "core/mod_manager.h"
 #include "core/tls.h"
 #include "ipc/ipc.h"
 
@@ -188,6 +189,14 @@ void Linker::Execute(const std::vector<std::string>& args) {
                     LOG_ERROR(Core_Linker, "Failed to load custom module: {}",
                               fmt::UTF(entry.path().u8string()));
                 }
+            }
+        }
+
+        // PRX mods switched on in the Mods tab, loaded and started the same way.
+        for (const auto& prx : Core::Mods::EnabledPrx(id)) {
+            LOG_INFO(Core_Linker, "Loading PRX mod: {}", fmt::UTF(prx.u8string()));
+            if (LoadAndStartModule(prx, 0, nullptr, nullptr) == -1) {
+                LOG_ERROR(Core_Linker, "Failed to load PRX mod: {}", fmt::UTF(prx.u8string()));
             }
         }
 

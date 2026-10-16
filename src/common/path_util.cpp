@@ -135,6 +135,7 @@ static auto UserPaths = [] {
     create_path(PathType::HomeDir, user_dir / HOME_DIR);
     create_path(PathType::CustomModulesDir, user_dir / CUSTOM_MODULES_DIR);
     create_path(PathType::LicensesDir, user_dir / LICENSES_DIR);
+    create_path(PathType::ModsDir, user_dir / MODS_DIR);
 
     std::ofstream notice_file(user_dir / CUSTOM_TROPHY / "Notice.txt");
     if (notice_file.is_open()) {

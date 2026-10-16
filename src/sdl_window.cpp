@@ -28,6 +28,7 @@
 #include "input/controller.h"
 #include "input/input_handler.h"
 #include "input/input_mouse.h"
+#include "core/bbsc_cinematic.h"
 #include "sdl_window.h"
 #include "video_core/renderdoc.h"
 
@@ -211,6 +212,11 @@ void WindowSDL::WaitEvent() {
     SDL_Event event;
 
     if (!SDL_WaitEvent(&event)) {
+        return;
+    }
+
+    // BBSC cinematic camera: while it is on, keyboard and mouse fly the camera (F1 toggles).
+    if (Core::Bbsc::CinematicHandleEvent(event, window)) {
         return;
     }
 

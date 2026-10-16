@@ -1,8 +1,13 @@
 //  SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <fstream>
 #include <map>
 #include <ranges>
+#include <nlohmann/json.hpp>
 #include <ImGuiFileDialog.h>
 #include <SDL3/SDL_events.h>
 #include <cmrc/cmrc.hpp>
@@ -13,6 +18,7 @@
 #include "common/path_util.h"
 #include "core/cpu_patches.h"
 #include "core/devtools/layer.h"
+#include "core/user_settings.h"
 #include "imgui/imgui_std.h"
 #include "input/input_handler.h"
 #include "settings_dialog_imgui.h"
@@ -94,6 +100,20 @@ void SettingsWindow::LoadSettings(std::string profile) {
         extraDmemSetting = EmulatorSettings.GetExtraDmemInMBytes();
         vblankFrequencySetting = EmulatorSettings.GetVblankFrequency();
     }
+
+    /////////// Mods Tab (a game profile, or the game that is running)
+    modSerial = isSpecific ? profile : runningGameSerial;
+    mods.clear();
+    modChoices.clear();
+    selectedMod = 0;
+    if (!modSerial.empty()) {
+        mods = Core::Mods::ModsForGame(modSerial, modChoices);
+    }
+
+    /////////// Users Tab
+    if (!isSpecific && !isGameRunning) {
+        LoadUsersTab();
+    }
 }
 
 void SettingsWindow::SaveSettings(std::string profile) {
@@ -152,7 +172,22 @@ void SettingsWindow::SaveSettings(std::string profile) {
         EmulatorSettings.SetVblankFrequency(vblankFrequencySetting, true);
     }
 
+    /////////// Users Tab (the server address is a global setting)
+    if (!isSpecific && !isGameRunning) {
+        EmulatorSettings.SetShadNetServer(shadnetServerSetting);
+    }
+
     isSpecific ? EmulatorSettings.Save(profile) : EmulatorSettings.Save();
+
+    /////////// Mods Tab
+    if (!modSerial.empty() && !mods.empty()) {
+        Core::Mods::SaveChoices(modSerial, modChoices);
+    }
+
+    /////////// Users Tab
+    if (!isSpecific && !isGameRunning) {
+        SaveUsersTab();
+    }
 
     // Switch the open window to the chosen display mode now rather than at the next launch.
     SDL_Event event{};
@@ -206,6 +241,8 @@ SettingsWindow::SettingsWindow(bool gameRunning) : isGameRunning(gameRunning) {
     loadTexture("src/resources/big_picture/log.png", logTexture);
     loadTexture("src/resources/big_picture/folder.png", foldersTexture);
     loadTexture("src/resources/big_picture/profiles.png", profilesTexture);
+    loadTexture("src/resources/big_picture/mods.png", modsTexture);
+    loadTexture("src/resources/big_picture/users.png", usersTexture);
 
     auto languageKeys = std::views::keys(languageMap);
     languageOptions.assign(languageKeys.begin(), languageKeys.end());
@@ -289,25 +326,44 @@ void SettingsWindow::SetupWindow() {
         ImGui::SetKeyboardFocusHere();
     }
 
-    SettingsCategory firstCategory =
-        isGameRunning ? SettingsCategory::General : SettingsCategory::Profiles;
-    SettingsCategory lastCategory =
-        currentProfile != "Global" ? SettingsCategory::Experimental : SettingsCategory::Log;
-
-    // Navigate categories with Tab / R1 / L1
-    if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1) || ImGui::IsKeyPressed(ImGuiKey_Tab)) {
-        int currentIndex = static_cast<int>(currentCategory);
-        currentCategory == lastCategory
-            ? currentCategory = static_cast<SettingsCategory>(firstCategory)
-            : currentCategory = static_cast<SettingsCategory>(currentIndex + 1);
+    // Navigate the visible categories with Tab / R1 / L1 (text boxes keep Tab for themselves)
+    const auto visible = VisibleCategories();
+    const auto found = std::ranges::find(visible, currentCategory);
+    const int count = static_cast<int>(visible.size());
+    const int index = found == visible.end() ? 0 : static_cast<int>(found - visible.begin());
+    if (found == visible.end()) {
+        currentCategory = visible.front();
+    }
+    const bool typing = ImGui::GetIO().WantTextInput;
+    if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1) ||
+        (!typing && ImGui::IsKeyPressed(ImGuiKey_Tab))) {
+        currentCategory = visible[(index + 1) % count];
     }
 
     if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1)) {
-        int currentIndex = static_cast<int>(currentCategory);
-        currentIndex == static_cast<int>(firstCategory)
-            ? currentCategory = lastCategory
-            : currentCategory = static_cast<SettingsCategory>(currentIndex - 1);
+        currentCategory = visible[(index + count - 1) % count];
     }
+}
+
+std::vector<SettingsWindow::SettingsCategory> SettingsWindow::VisibleCategories() const {
+    std::vector<SettingsCategory> visible;
+    if (!isGameRunning) {
+        visible.push_back(SettingsCategory::Profiles);
+    }
+    visible.insert(visible.end(), {SettingsCategory::General, SettingsCategory::Graphics,
+                                   SettingsCategory::Input, SettingsCategory::Trophy,
+                                   SettingsCategory::Folders, SettingsCategory::Log});
+    const bool isGlobal = currentProfile == "Global";
+    if (isGlobal && !isGameRunning) {
+        visible.push_back(SettingsCategory::Users);
+    }
+    if (!isGlobal) {
+        visible.push_back(SettingsCategory::Experimental);
+    }
+    if (!modSerial.empty()) {
+        visible.push_back(SettingsCategory::Mods);
+    }
+    return visible;
 }
 
 void SettingsWindow::DrawCategoryTabs() {
@@ -326,20 +382,39 @@ void SettingsWindow::DrawCategoryTabs() {
 
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(30.0f * uiScale, 0.0f));
 
-    // Must add categories in enum order for L1/R1 to work correctly
-    if (!isGameRunning) {
-        AddCategory("Profiles", profilesTexture, SettingsCategory::Profiles);
-    }
-
-    AddCategory("General", generalTexture, SettingsCategory::General);
-    AddCategory("Graphics", graphicsTexture, SettingsCategory::Graphics);
-    AddCategory("Input", inputTexture, SettingsCategory::Input);
-    AddCategory("Trophy", trophyTexture, SettingsCategory::Trophy);
-    AddCategory("Game Folders", foldersTexture, SettingsCategory::Folders);
-    AddCategory("Log", logTexture, SettingsCategory::Log);
-
-    if (currentProfile != "Global") {
-        AddCategory("Experimental", experimentalTexture, SettingsCategory::Experimental);
+    for (const SettingsCategory category : VisibleCategories()) {
+        switch (category) {
+        case SettingsCategory::Profiles:
+            AddCategory("Profiles", profilesTexture, category);
+            break;
+        case SettingsCategory::General:
+            AddCategory("General", generalTexture, category);
+            break;
+        case SettingsCategory::Graphics:
+            AddCategory("Graphics", graphicsTexture, category);
+            break;
+        case SettingsCategory::Input:
+            AddCategory("Input", inputTexture, category);
+            break;
+        case SettingsCategory::Trophy:
+            AddCategory("Trophy", trophyTexture, category);
+            break;
+        case SettingsCategory::Folders:
+            AddCategory("Game Folders", foldersTexture, category);
+            break;
+        case SettingsCategory::Log:
+            AddCategory("Log", logTexture, category);
+            break;
+        case SettingsCategory::Users:
+            AddCategory("Users", usersTexture, category);
+            break;
+        case SettingsCategory::Experimental:
+            AddCategory("Experimental", experimentalTexture, category);
+            break;
+        case SettingsCategory::Mods:
+            AddCategory("Mods", modsTexture, category);
+            break;
+        }
     }
 
     ImGui::PopStyleVar();
@@ -386,10 +461,14 @@ void SettingsWindow::DrawMainContent(bool* open, const std::function<void()>& ap
     ImVec4 settingsColor = ImVec4(0.1f, 0.1f, 0.12f, 0.8f); // Darker gray
     ImGui::PushStyleColor(ImGuiCol_ChildBg, settingsColor);
 
-    std::string centeredText;
-    currentCategory == SettingsCategory::Folders
-        ? centeredText = "Manage shadPS4 Game Folders"
-        : centeredText = "Selected Profile: " + currentProfile;
+    std::string centeredText = "Selected Profile: " + currentProfile;
+    if (currentCategory == SettingsCategory::Folders) {
+        centeredText = "Manage shadPS4 Game Folders";
+    } else if (currentCategory == SettingsCategory::Users) {
+        centeredText = "Users and shadNet accounts";
+    } else if (currentCategory == SettingsCategory::Mods) {
+        centeredText = "Mods for " + modSerial;
+    }
 
     ImGui::Separator();
     Overlay::TextCentered(centeredText.c_str());
@@ -399,6 +478,10 @@ void SettingsWindow::DrawMainContent(bool* open, const std::function<void()>& ap
         DrawProfileSelector();
     } else if (currentCategory == SettingsCategory::Folders) {
         DrawGameFolderManager();
+    } else if (currentCategory == SettingsCategory::Mods) {
+        DrawModsTab();
+    } else if (currentCategory == SettingsCategory::Users) {
+        DrawUsersTab();
     } else {
         DrawSettingsTable(currentCategory);
     }
@@ -842,6 +925,424 @@ void SettingsWindow::AddSettingCombo(std::string name, int& value,
         }
         ImGui::EndCombo();
     }
+}
+
+// ---------------------------------------------------------------- Mods / Users tabs (BBSC fork)
+
+static bool InputString(const char* label, std::string& value, ImGuiInputTextFlags flags = 0) {
+    char buffer[512];
+    std::snprintf(buffer, sizeof(buffer), "%s", value.c_str());
+    if (ImGui::InputText(label, buffer, sizeof(buffer), flags)) {
+        value = buffer;
+        return true;
+    }
+    return false;
+}
+
+static void OpenFolder(const std::filesystem::path& folder) {
+    std::error_code ec;
+    std::filesystem::create_directories(folder, ec);
+    SDL_OpenURL(("file:///" + folder.generic_string()).c_str());
+}
+
+void SettingsWindow::DrawModSetting(const Core::Mods::SettingDef& def, std::string& value) {
+    const std::string label = "##mod_" + def.id;
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::TextWrapped("%s", def.name.c_str());
+    if (!def.description.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
+        ImGui::TextWrapped("%s", def.description.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::TableNextColumn();
+    switch (def.type) {
+    case Core::Mods::SettingType::Bool: {
+        bool on = value == "1";
+        if (ImGui::Checkbox(label.c_str(), &on)) {
+            value = on ? "1" : "0";
+        }
+        break;
+    }
+    case Core::Mods::SettingType::Int: {
+        int number = std::atoi(value.c_str());
+        if (ImGui::SliderInt(label.c_str(), &number, def.min, def.max)) {
+            value = std::to_string(number);
+        }
+        break;
+    }
+    case Core::Mods::SettingType::Choice: {
+        if (def.options.empty()) {
+            break;
+        }
+        int index = GetComboIndex(value, def.options);
+        if (ImGui::BeginCombo(label.c_str(), def.options[index].c_str())) {
+            for (int i = 0; i < static_cast<int>(def.options.size()); i++) {
+                if (ImGui::Selectable(def.options[i].c_str(), i == index)) {
+                    value = def.options[i];
+                }
+            }
+            ImGui::EndCombo();
+        }
+        break;
+    }
+    case Core::Mods::SettingType::Text:
+        ImGui::SetNextItemWidth(-1.0f);
+        InputString(label.c_str(), value);
+        break;
+    }
+}
+
+void SettingsWindow::DrawModsTab() {
+    ImGuiWindowFlags child_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NavFlattened;
+    ImGui::BeginChild("ContentRegion", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), true,
+                      child_flags);
+
+    const auto modsFolder = Common::FS::GetUserPath(Common::FS::PathType::ModsDir);
+    if (ImGui::Button("Open Mods Folder", ImVec2(400.f * uiScale, 0))) {
+        OpenFolder(modsFolder);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Rescan", ImVec2(250.f * uiScale, 0))) {
+        // Pick up new mod folders, keeping what was already changed here.
+        mods = Core::Mods::ModsForGame(modSerial, modChoices);
+        selectedMod = 0;
+    }
+    if (isGameRunning) {
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                           "Changes take effect the next time the game starts.");
+    }
+
+    if (mods.empty()) {
+        ImGui::TextWrapped("No mods for this game. Put a mod folder (DLL, PRX, patch XML or game "
+                           "files) in %s\\%s", modsFolder.string().c_str(), modSerial.c_str());
+        ImGui::EndChild();
+        return;
+    }
+    selectedMod = std::clamp(selectedMod, 0, static_cast<int>(mods.size()) - 1);
+    int moveMod = 0;
+
+    if (ImGui::BeginTable("ModsLayout", 2, ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableSetupColumn("ModList", ImGuiTableColumnFlags_WidthFixed, 520.0f * uiScale);
+        ImGui::TableSetupColumn("ModDetails");
+        ImGui::TableNextRow();
+
+        // Left: every mod with its on/off switch
+        ImGui::TableNextColumn();
+        for (int i = 0; i < static_cast<int>(mods.size()); i++) {
+            const auto& mod = mods[i];
+            auto& choice = modChoices[mod.id];
+            ImGui::PushID(i);
+            ImGui::Checkbox("##enabled", &choice.enabled);
+            ImGui::SameLine();
+            const std::string label = std::to_string(i + 1) + ". " + mod.name + "  [" +
+                                      mod.Kinds() + "]";
+            if (ImGui::Selectable(label.c_str(), selectedMod == i)) {
+                selectedMod = i;
+            }
+            if (!mod.problem.empty()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "  %s", mod.problem.c_str());
+            }
+            ImGui::PopID();
+        }
+
+        // Right: the selected mod and its settings
+        ImGui::TableNextColumn();
+        const auto& mod = mods[selectedMod];
+        auto& choice = modChoices[mod.id];
+        ImGui::Text("%s", mod.name.c_str());
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
+        ImGui::TextWrapped("Version: %s%s%s", mod.version.empty() ? "-" : mod.version.c_str(),
+                           mod.author.empty() ? "" : "   By: ", mod.author.c_str());
+        ImGui::TextWrapped("Type: %s", mod.Kinds().c_str());
+        ImGui::PopStyleColor();
+        if (!mod.description.empty()) {
+            ImGui::TextWrapped("%s", mod.description.c_str());
+        }
+        // Load order: higher in the list wins when two mods change the same game file.
+        if (ImGui::Button("Move Up")) {
+            moveMod = -1;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Move Down")) {
+            moveMod = 1;
+        }
+        if (!mod.problem.empty()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Cannot run: %s",
+                               mod.problem.c_str());
+        }
+        ImGui::Checkbox("Enabled##selected", &choice.enabled);
+
+        if (!mod.settings.empty()) {
+            ImGui::Separator();
+            if (!choice.enabled) {
+                ImGui::BeginDisabled();
+            }
+            if (ImGui::BeginTable("ModSettings", 2)) {
+                ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+                ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+                for (const auto& def : mod.settings) {
+                    DrawModSetting(def, choice.values[def.id]);
+                }
+                ImGui::EndTable();
+            }
+            if (!choice.enabled) {
+                ImGui::EndDisabled();
+            }
+        }
+        ImGui::EndTable();
+    }
+
+    // Load order change, applied after drawing so nothing above points at a moved entry.
+    if (const int target = selectedMod + moveMod;
+        moveMod != 0 && target >= 0 && target < static_cast<int>(mods.size())) {
+        std::swap(modChoices[mods[selectedMod].id].order, modChoices[mods[target].id].order);
+        std::swap(mods[selectedMod], mods[target]);
+        selectedMod = target;
+    }
+
+    ImGui::EndChild();
+}
+
+void SettingsWindow::LoadUsersTab() {
+    editUsers = UserManagement.GetUsers().user;
+    selectedUser = 0;
+    const User* defaultUser = UserManagement.GetUserByPlayerIndex(1);
+    defaultUserId = defaultUser != nullptr ? defaultUser->user_id : -1;
+    shadnetServerSetting = EmulatorSettings.GetShadNetServer();
+
+    // Server cards: <user>/servers/*.json = {"name", "shadnet": "host:port", "registration_key"}
+    serverCards.clear();
+    selectedCard = -1;
+    const auto folder = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "servers";
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(folder, ec)) {
+        if (entry.path().extension() != ".json") {
+            continue;
+        }
+        try {
+            std::ifstream file(entry.path());
+            const auto j = nlohmann::json::parse(file, nullptr, true, true);
+            ServerCard card;
+            card.name = j.value("name", entry.path().stem().string());
+            card.address = j.value("shadnet", "");
+            card.key = j.value("registration_key", "");
+            if (!card.address.empty()) {
+                serverCards.push_back(std::move(card));
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR(ImGui, "Could not read server card {}: {}", entry.path().string(), e.what());
+        }
+    }
+    for (int i = 0; i < static_cast<int>(serverCards.size()); i++) {
+        if (serverCards[i].address == shadnetServerSetting) {
+            selectedCard = i;
+            registrationKey = serverCards[i].key;
+        }
+    }
+}
+
+void SettingsWindow::SaveUsersTab() {
+    for (const User& edited : editUsers) {
+        if (User* user = UserManagement.GetUserByID(edited.user_id)) {
+            user->user_name = edited.user_name;
+            user->user_color = edited.user_color;
+            user->shadnet_enabled = edited.shadnet_enabled;
+            user->shadnet_npid = edited.shadnet_npid;
+            user->shadnet_password = edited.shadnet_password;
+            user->shadnet_email = edited.shadnet_email;
+        } else {
+            UserManagement.AddUser(edited); // also makes its home / savedata folders
+        }
+    }
+    const User* current = UserManagement.GetUserByPlayerIndex(1);
+    if (defaultUserId >= 0 && (current == nullptr || current->user_id != defaultUserId)) {
+        UserManagement.SetControllerPort(static_cast<u32>(defaultUserId), 1);
+    }
+    UserManagement.Save();
+}
+
+void SettingsWindow::DrawUsersTab() {
+    ImGuiWindowFlags child_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NavFlattened;
+    ImGui::BeginChild("ContentRegion", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), true,
+                      child_flags);
+
+    // A finished "create account" request
+    if (createAccountJob.valid() &&
+        createAccountJob.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        const auto result = createAccountJob.get();
+        createAccountOk = result.ok;
+        createAccountMessage = result.message;
+        if (result.ok && selectedUser < static_cast<int>(editUsers.size())) {
+            editUsers[selectedUser].shadnet_enabled = true;
+        }
+    }
+    const bool creating = createAccountJob.valid();
+
+    // ---- Server
+    if (ImGui::BeginTable("ServerTable", 2)) {
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 500.0f * uiScale);
+        ImGui::TableSetupColumn("Value");
+
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::TextWrapped("Server card");
+        ImGui::TableNextColumn();
+        const char* cardName =
+            selectedCard >= 0 ? serverCards[selectedCard].name.c_str() : "(type the address)";
+        if (ImGui::BeginCombo("##ServerCard", cardName)) {
+            if (ImGui::Selectable("(type the address)", selectedCard < 0)) {
+                selectedCard = -1;
+            }
+            for (int i = 0; i < static_cast<int>(serverCards.size()); i++) {
+                if (ImGui::Selectable(serverCards[i].name.c_str(), selectedCard == i)) {
+                    selectedCard = i;
+                    shadnetServerSetting = serverCards[i].address;
+                    registrationKey = serverCards[i].key;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Open Cards Folder")) {
+            OpenFolder(Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "servers");
+        }
+
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::TextWrapped("shadNet server (host:port)");
+        ImGui::TableNextColumn();
+        ImGui::SetNextItemWidth(-1.0f);
+        if (InputString("##ShadNetServer", shadnetServerSetting)) {
+            selectedCard = -1;
+        }
+        ImGui::EndTable();
+    }
+    ImGui::Separator();
+
+    if (editUsers.empty()) {
+        ImGui::TextWrapped("No users found.");
+        ImGui::EndChild();
+        return;
+    }
+    selectedUser = std::clamp(selectedUser, 0, static_cast<int>(editUsers.size()) - 1);
+
+    if (ImGui::BeginTable("UsersLayout", 2, ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableSetupColumn("UserList", ImGuiTableColumnFlags_WidthFixed, 520.0f * uiScale);
+        ImGui::TableSetupColumn("UserDetails");
+        ImGui::TableNextRow();
+
+        // Left: users
+        ImGui::TableNextColumn();
+        for (int i = 0; i < static_cast<int>(editUsers.size()); i++) {
+            const User& user = editUsers[i];
+            std::string label = std::to_string(user.user_id) + "  " + user.user_name;
+            if (user.user_id == defaultUserId) {
+                label += "  (default)";
+            }
+            if (user.shadnet_enabled && !user.shadnet_npid.empty()) {
+                label += "\n      shadNet: " + user.shadnet_npid;
+            }
+            label += "##user" + std::to_string(i);
+            if (ImGui::Selectable(label.c_str(), selectedUser == i)) {
+                selectedUser = i;
+                createAccountMessage.clear();
+            }
+        }
+        if (ImGui::Button("Add User", ImVec2(-1.0f, 0))) {
+            s32 nextId = 1000;
+            for (const User& user : editUsers) {
+                nextId = std::max(nextId, user.user_id + 1);
+            }
+            User user;
+            user.user_id = nextId;
+            user.user_name = "User " + std::to_string(nextId);
+            user.player_index = -1;
+            editUsers.push_back(user);
+            selectedUser = static_cast<int>(editUsers.size()) - 1;
+            createAccountMessage.clear();
+        }
+
+        // Right: the selected user
+        ImGui::TableNextColumn();
+        User& user = editUsers[selectedUser];
+        if (ImGui::BeginTable("UserFields", 2)) {
+            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.4f);
+            const auto row = [](const char* name) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextWrapped("%s", name);
+                ImGui::TableNextColumn();
+                ImGui::SetNextItemWidth(-1.0f);
+            };
+
+            row("Name");
+            InputString("##UserName", user.user_name);
+            row("Default user (player 1)");
+            bool isDefault = user.user_id == defaultUserId;
+            if (ImGui::Checkbox("##UserDefault", &isDefault) && isDefault) {
+                defaultUserId = user.user_id;
+            }
+            row("Use shadNet");
+            ImGui::Checkbox("##UserShadNet", &user.shadnet_enabled);
+            row("shadNet ID");
+            InputString("##UserNpid", user.shadnet_npid);
+            row("Password");
+            InputString("##UserPassword", user.shadnet_password, ImGuiInputTextFlags_Password);
+            row("Email (optional)");
+            InputString("##UserEmail", user.shadnet_email);
+            row("Registration key (from the host)");
+            InputString("##RegistrationKey", registrationKey, ImGuiInputTextFlags_Password);
+            ImGui::EndTable();
+        }
+
+        const bool canCreate = !creating && !user.shadnet_npid.empty() &&
+                               !user.shadnet_password.empty() && !shadnetServerSetting.empty();
+        if (!canCreate) {
+            ImGui::BeginDisabled();
+        }
+        if (ImGui::Button("Create Account on Server", ImVec2(-1.0f, 0))) {
+            std::string host;
+            u16 port = 0;
+            if (!ShadNet::SplitServerAddress(shadnetServerSetting, host, port)) {
+                createAccountOk = false;
+                createAccountMessage = "The server address should look like host:31313.";
+            } else {
+                if (user.shadnet_email.empty()) {
+                    user.shadnet_email = user.shadnet_npid + "@shadnet.local";
+                }
+                createAccountMessage.clear();
+                createAccountJob = std::async(
+                    std::launch::async,
+                    [host, port, npid = user.shadnet_npid, password = user.shadnet_password,
+                     email = user.shadnet_email, key = registrationKey] {
+                        return ShadNet::CreateAccount(host, port, npid, password, email, key);
+                    });
+            }
+        }
+        if (!canCreate) {
+            ImGui::EndDisabled();
+        }
+
+        if (creating) {
+            ImGui::TextWrapped("Contacting the server...");
+        } else if (!createAccountMessage.empty()) {
+            ImGui::TextColored(createAccountOk ? ImVec4(0.4f, 1.0f, 0.4f, 1.0f)
+                                               : ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+                               "%s", createAccountMessage.c_str());
+        }
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
+        ImGui::TextWrapped("The account is made on the server above, so it works from any PC. "
+                           "Press Save to keep the changes on this page.");
+        ImGui::PopStyleColor();
+        ImGui::EndTable();
+    }
+
+    ImGui::EndChild();
 }
 
 } // namespace ImGuiEmuSettings

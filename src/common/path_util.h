@@ -30,6 +30,7 @@ enum class PathType {
     HomeDir,          // PS4 home directory
     CustomModulesDir, // Where custom modules are stored.
     LicensesDir,      // Where license files are stored.
+    ModsDir,          // Where DLL mods (mods/<id>/mod.json) and their per-game choices are stored.
 };
 
 constexpr auto PORTABLE_DIR = "user";
@@ -54,6 +55,7 @@ constexpr auto TROPHY_DIR = "trophy";
 constexpr auto HOME_DIR = "home";
 constexpr auto CUSTOM_MODULES_DIR = "custom_modules";
 constexpr auto LICENSES_DIR = "licenses";
+constexpr auto MODS_DIR = "mods";
 
 // Filenames
 constexpr auto LOG_FILE = "shad_log.txt";

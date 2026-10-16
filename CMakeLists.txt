@@ -212,6 +212,13 @@ execute_process(
 )
 
 # Set Version
+# BBSC_VANILLA: the emulator without the built-in BBSC (0.17.1 + online base + mod loader);
+# BBSC then comes as the bbsc.dll mod (src-shadp2p/mod), switched on/off in the Mods tab.
+option(BBSC_VANILLA "Build without the built-in BBSC (BBSC runs as the bbsc.dll mod)" OFF)
+if (BBSC_VANILLA)
+    add_compile_definitions(BBSC_VANILLA)
+endif()
+
 set(EMULATOR_VERSION_MAJOR "0")
 set(EMULATOR_VERSION_MINOR "19")
 set(EMULATOR_VERSION_PATCH "0")
@@ -662,6 +669,8 @@ set(NP_LIBS src/core/libraries/np/np_error.h
             src/core/libraries/np/np_sns_facebook_dialog.h
             src/core/libraries/np/np_partner.cpp
             src/core/libraries/np/np_partner.h
+            src/core/libraries/np/np_utility.cpp
+            src/core/libraries/np/np_utility.h
             src/core/libraries/np/object_manager.h
             src/core/libraries/np/np_handler.cpp
             src/core/libraries/np/np_handler.h
@@ -699,9 +708,6 @@ set(NP_LIBS src/core/libraries/np/np_error.h
             src/core/libraries/np/np_tus/np_tus.cpp
             src/core/libraries/np/np_tus/np_tus.h
             src/core/libraries/np/np_tus/np_tus_ctx.h
-            src/core/libraries/np/np_utility/np_utility.cpp
-            src/core/libraries/np/np_utility/np_utility.h
-            src/core/libraries/np/np_utility/np_utility_ctx.h
 )
 
 set(ZLIB_LIB src/core/libraries/zlib/zlib.cpp
@@ -972,6 +978,16 @@ set(CORE src/core/aerolib/stubs.cpp
 
 if (ARCHITECTURE STREQUAL "x86_64")
     set(CORE ${CORE}
+             src/core/bbsc_persistence.cpp
+             src/core/bbsc_cinematic.cpp
+             src/core/bbsc_cinematic.h
+             src/core/bbsc_persistence.h
+             src/core/bbsc_memscan.cpp
+             src/core/bbsc_memscan.h
+             src/core/bloodborne_re.cpp
+             src/core/mod_manager.cpp
+             src/core/mod_manager.h
+             src/core/bloodborne_re.h
              src/core/cpu_patches.cpp
              src/core/cpu_patches.h
              ${FIBER_LIB})
@@ -1224,6 +1240,10 @@ set(IMGUI src/imgui/imgui_config.h
           src/imgui/shadnet_notifications_layer.h
           src/imgui/notifications_layer.cpp
           src/imgui/notifications_layer.h
+          src/imgui/bbsc_intro_layer.cpp
+          src/imgui/bbsc_intro_layer.h
+          src/imgui/bbsc_loading_layer.cpp
+          src/imgui/bbsc_loading_layer.h
           src/imgui/renderer/imgui_core.cpp
           src/imgui/renderer/imgui_core.h
           src/imgui/renderer/imgui_impl_sdl3.cpp
@@ -1286,6 +1306,8 @@ set(SHADNET src/shadnet/client.cpp
             src/shadnet/client.h
             src/shadnet/server_probe.cpp
             src/shadnet/server_probe.h
+            src/shadnet/account_create.cpp
+            src/shadnet/account_create.h
             "${SHADNET_PROTO_OUT}/shadnet.pb.cc"
 )
 if (APPLE)
@@ -1480,9 +1502,11 @@ cmrc_add_resource_library(embedded-resources
         src/resources/big_picture/folder.png
         src/resources/big_picture/graphics.png
         src/resources/big_picture/log.png
+        src/resources/big_picture/mods.png
         src/resources/big_picture/profiles.png
         src/resources/big_picture/settings.png
         src/resources/big_picture/trophy.png
+        src/resources/big_picture/users.png
         src/resources/bronze.png
         src/resources/gold.png
         src/resources/platinum.png

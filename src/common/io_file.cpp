@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <thread>
 #include <vector>
 
 #include "common/alignment.h"
@@ -190,6 +192,25 @@ int IOFile::Open(const fs::path& path, FileAccessMode mode, FileType type, FileS
         result = errno;
     } else {
         result = _wfopen_s(&file, path.c_str(), AccessModeToWStr(mode, type));
+        // BBSC: _wfopen_s opens a file exclusively, so it fails with EACCES while any other handle
+        // to it is open - shared or not. The save backup thread (save_backup.cpp) reads the whole
+        // save folder after a save, and every game write that landed during that copy failed:
+        // 151 of 158 Bloodborne save writes on 2026-09-23, 126 of 129 on 2026-09-19 (host logs).
+        // A busy file is waited for instead of treated as permission denied. Only for a file
+        // that exists - a missing file or directory cannot be "busy", so it fails at once as before.
+        std::error_code exists_error;
+        if (result == EACCES && fs::is_regular_file(path, exists_error)) {
+            int retries = 0;
+            while (result == EACCES && retries < 40) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{50});
+                ++retries;
+                result = _wfopen_s(&file, path.c_str(), AccessModeToWStr(mode, type));
+            }
+            if (result == 0) {
+                LOG_WARNING(Common_Filesystem, "File was busy, opened after {} retries: {}",
+                            retries, PathToUTF8String(path));
+            }
+        }
     }
 #else
     file = std::fopen(path.c_str(), AccessModeToStr(mode, type));

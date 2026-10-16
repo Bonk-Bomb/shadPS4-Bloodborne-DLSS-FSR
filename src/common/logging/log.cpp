@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <fmt/std.h>
@@ -153,9 +154,20 @@ void Switch(std::string_view game_filename, bool append_log) {
     UpdateLogFlushLevel(EmulatorSettings.GetLogFlushLevel());
 
     g_shad_file_sink->_size_limit = EmulatorSettings.GetLogSizeLimit();
-    g_shad_file_sink->session_file_helper_.open(
-        (GetUserPath(Common::FS::PathType::LogDir) / game_filename).string(),
-        !(append_log || EmulatorSettings.IsLogAppend()));
+    const auto game_log = GetUserPath(Common::FS::PathType::LogDir) / game_filename;
+    const bool append = append_log || EmulatorSettings.IsLogAppend();
+    if (!append) {
+        // BBSC: the previous run's log survives one restart as <name>.prev<ext>, so a crash log is
+        // still there after the player starts the game again (lost twice on 2026-09-24).
+        std::error_code ec;
+        if (std::filesystem::exists(game_log, ec)) {
+            auto previous = game_log;
+            previous.replace_extension(".prev" + game_log.extension().string());
+            std::filesystem::copy_file(game_log, previous,
+                                       std::filesystem::copy_options::overwrite_existing, ec);
+        }
+    }
+    g_shad_file_sink->session_file_helper_.open(game_log.string(), !append);
 }
 
 void Shutdown() {

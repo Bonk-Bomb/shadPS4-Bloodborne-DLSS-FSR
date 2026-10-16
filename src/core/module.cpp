@@ -10,6 +10,9 @@
 #include "common/sha1.h"
 #include "common/string_util.h"
 #include "core/aerolib/aerolib.h"
+#include "core/bbsc_persistence.h"
+#include "core/bloodborne_re.h"
+#include "imgui/bbsc_intro_layer.h"
 #include "core/cpu_patches.h"
 #include "core/libraries/error_codes.h"
 #include "core/loader/dwarf.h"
@@ -346,6 +349,26 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             MemoryPatcher::g_eboot_image_size = base_size;
             MemoryPatcher::g_eboot_name = name;
             MemoryPatcher::OnGameLoaded();
+#ifdef ARCH_X86_64
+            // Printed before any check, on every run, so one grep for "BBSC build" answers "is
+            // this even the right emulator?". Every installer below can decline for reasons that
+            // used to be silent - wrong serial, wrong game version, a switch turned off - which
+            // made a stock build and a build that declined look identical in the log. That cost a
+            // full test session on 2026-09-22.
+            LOG_INFO(Core_Linker, "BBSC build: serial={} base={:#x} size={:#x}",
+                     MemoryPatcher::g_game_serial.empty() ? "(none)"
+                                                          : MemoryPatcher::g_game_serial,
+                     base_virtual_addr, base_size);
+            if constexpr (Bbsc::BuiltIn) {
+                Bloodborne::InstallSeamlessCoopPatches();
+                Bbsc::InstallPersistentSessionPatches();
+                Bloodborne::InstallReverseEngineeringTrace();
+                Bbsc::StartIntro(MemoryPatcher::g_game_serial);
+            } else {
+                LOG_INFO(Core_Linker, "BBSC build: vanilla - no built-in BBSC, it runs as the "
+                                      "bbsc.dll mod when switched on in the Mods tab");
+            }
+#endif
         }
     }
 }

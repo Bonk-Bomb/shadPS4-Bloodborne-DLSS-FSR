@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <set>
+#include <string_view>
 #include <sstream>
 #include <SDL3/SDL_video.h>
 #include <fmt/core.h>
@@ -38,6 +40,7 @@
 #include "core/file_format/trp.h"
 #include "core/file_sys/bb_hdr_compat.h"
 #include "core/file_sys/fs.h"
+#include "core/mod_manager.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/np/np_trophy.h"
@@ -472,9 +475,22 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
 
     EmulatorSettings.Load(id);
     // Switch to configured log
-    Common::Log::Switch((!id.empty() && EmulatorSettings.IsLogSeparate()) ? id + ".log"
-                                                                          : "shad_log.txt",
-                        append_log);
+    // BBSC: SHADPS4_LOG_NAME gives each window of a multi-window test its own log file.
+    if (const char* log_name = std::getenv("SHADPS4_LOG_NAME");
+        log_name != nullptr && *log_name != '\0') {
+        Common::Log::Switch(log_name, append_log);
+    } else {
+        Common::Log::Switch((!id.empty() && EmulatorSettings.IsLogSeparate()) ? id + ".log"
+                                                                              : "shad_log.txt",
+                            append_log);
+    }
+    // Mods tab choices for this game go into the environment before anything reads a switch.
+    Core::Mods::ApplyEnvironment(id);
+    // File mods are layered over the game before anything else is read from it.
+    if (const auto overlays = Core::Mods::FileOverlays(id); !overlays.empty()) {
+        mnt->AddOverlays("/app0", overlays);
+        mnt->AddOverlays("/hostapp", overlays);
+    }
 
     auto guest_eboot_path = "/app0/" + eboot_name.generic_string();
 
@@ -745,9 +761,18 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         std::quick_exit(0);
     }
 
+    // DLL mods go in once the game's code is in memory, before it runs.
+    Core::Mods::LoadEnabledDlls(id);
+
 #ifdef ENABLE_DISCORD_RPC
-    // Discord RPC
-    if (EmulatorSettings.IsDiscordRPCEnabled()) {
+    // Discord RPC - not when the BBSC mod shows its own status ("Discord status" in the Mods tab,
+    // set by ApplyEnvironment above), or Discord would show both.
+    const char* bbsc_discord = std::getenv("SHADPS4_BBSC_DISCORD");
+    const bool bbsc_status = bbsc_discord != nullptr && std::string_view{bbsc_discord} == "1";
+    if (bbsc_status) {
+        LOG_INFO(Loader, "Discord RPC: left to the BBSC mod's Discord status");
+    }
+    if (EmulatorSettings.IsDiscordRPCEnabled() && !bbsc_status) {
         auto* rpc = Common::Singleton<DiscordRPCHandler::RPC>::Instance();
         if (rpc->getRPCEnabled() == false) {
             rpc->init();

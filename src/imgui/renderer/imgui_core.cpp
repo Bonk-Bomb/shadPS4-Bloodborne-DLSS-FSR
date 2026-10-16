@@ -5,6 +5,8 @@
 #include <atomic>
 #include <bit>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 #include <SDL3/SDL_events.h>
 #include <imgui.h>
 
@@ -103,6 +105,24 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
     // Big Picture
     FontStack::AddPrimaryUiFont(ImGui::GetIO().Fonts, 64.0f, EmulatorSettings.GetConsoleLanguage(),
                                 font_cfg, true);
+
+    // BBSC intro title (IMGUI_FONT_BBSC_TITLE): a serif read from this PC's own font folder, so no
+    // font file is shipped. Garamond (with Office), else Palatino / Georgia (with Windows). ASCII only,
+    // to keep the atlas small (also used by the BBSC loading screen).
+#ifdef _WIN32
+    if (const char* windir = std::getenv("WINDIR")) {
+        // Printable ASCII, the middle dot and curly quotes (the loading screen and its hints use them).
+        static const ImWchar TitleGlyphs[] = {0x0020, 0x007E, 0x00B7, 0x00B7, 0x2018, 0x2019, 0};
+        for (const char* name : {"GARA.TTF", "pala.ttf", "georgia.ttf"}) {
+            const auto file = std::filesystem::path(windir) / "Fonts" / name;
+            std::error_code ec;
+            if (std::filesystem::exists(file, ec)) {
+                io.Fonts->AddFontFromFileTTF(file.string().c_str(), 128.0f, nullptr, TitleGlyphs);
+                break;
+            }
+        }
+    }
+#endif
 
     // Let the atlas size grow to the largest image the device can create,
     // floored to the power of two the packer requires.

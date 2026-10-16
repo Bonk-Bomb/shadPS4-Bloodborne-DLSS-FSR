@@ -4,6 +4,7 @@
 #pragma once
 
 #include <functional>
+#include <future>
 #include <map>
 #include <variant>
 #include <SDL3/SDL.h>
@@ -11,6 +12,9 @@
 
 #include "big_picture.h"
 #include "core/emulator_settings.h"
+#include "core/mod_manager.h"
+#include "core/user_manager.h"
+#include "shadnet/account_create.h"
 #include "imgui/imgui_texture.h"
 
 namespace ImGuiEmuSettings {
@@ -31,8 +35,12 @@ private:
         Trophy,
         Folders,
         Log,
-        Experimental,
+        Users,        // Global profile only
+        Experimental, // game profiles only
+        Mods,         // game profiles only
     };
+
+    std::vector<SettingsCategory> VisibleCategories() const;
 
     void SaveSettings(std::string profile);
     void LoadSettings(std::string profile);
@@ -46,6 +54,9 @@ private:
     void DrawSettingsTable(SettingsCategory);
     void DrawProfileSelector();
     void DrawGameFolderManager();
+    void DrawModsTab();
+    void DrawModSetting(const Core::Mods::SettingDef& def, std::string& value);
+    void DrawUsersTab();
     void DrawCategoryTabs();
     void AddCategory(std::string name, std::variant<SDL_Texture*, ImGui::RefCountedTexture> texture,
                      SettingsCategory category);
@@ -76,6 +87,33 @@ private:
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> trophyTexture;
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> logTexture;
     std::variant<SDL_Texture*, ImGui::RefCountedTexture> foldersTexture;
+    std::variant<SDL_Texture*, ImGui::RefCountedTexture> modsTexture;
+    std::variant<SDL_Texture*, ImGui::RefCountedTexture> usersTexture;
+
+    // Mods tab (game profiles): every mod for this game and the choices being edited
+    std::string modSerial;
+    std::vector<Core::Mods::ModInfo> mods;
+    Core::Mods::Choices modChoices;
+    int selectedMod = 0;
+
+    // Users tab (Global profile, outside a game): a copy of the users, written on Save
+    struct ServerCard {
+        std::string name;
+        std::string address; // host:port of the shadNet server
+        std::string key;     // RegistrationSecretKey, may be empty
+    };
+    void LoadUsersTab();
+    void SaveUsersTab();
+    std::vector<User> editUsers;
+    int selectedUser = 0;
+    int defaultUserId = -1;
+    std::string shadnetServerSetting;
+    std::vector<ServerCard> serverCards;
+    int selectedCard = -1;
+    std::string registrationKey;
+    std::future<ShadNet::CreateAccountResult> createAccountJob;
+    std::string createAccountMessage;
+    bool createAccountOk = false;
 
     //////////////////// options for comboboxes
     const std::map<std::string, int> languageMap = {{"Arabic", 21},

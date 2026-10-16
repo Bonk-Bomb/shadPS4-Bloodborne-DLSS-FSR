@@ -16,6 +16,8 @@
 #define IMGUI_FONT_MONO 1
 #define IMGUI_FONT_TEXT_BIG 2
 #define IMGUI_FONT_SETTINGS_WINDOW 3
+// BBSC intro title (a serif from the Windows font folder); only there when one was found.
+#define IMGUI_FONT_BBSC_TITLE 4
 
 namespace ImGui {
 

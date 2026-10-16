@@ -56,7 +56,9 @@ int main(int argc, char* argv[]) {
     std::optional<std::string> gamePath;
     std::vector<std::string> gameArgs;
     std::optional<std::filesystem::path> overrideRoot;
+    std::optional<std::filesystem::path> cacheDir;
     std::optional<int> waitPid;
+    std::optional<u32> userId;
     bool waitForDebugger = false;
     bool userfaultfd = false;
 
@@ -90,6 +92,8 @@ int main(int argc, char* argv[]) {
     app.add_option("-f,--fullscreen", fullscreenStr, "Fullscreen mode (true|false)");
 
     app.add_option("--override-root", overrideRoot)->check(CLI::ExistingDirectory);
+    app.add_option("--cache-dir", cacheDir, "Use a cache directory for this process")
+        ->check(CLI::ExistingDirectory);
 
     app.add_flag("--wait-for-debugger", waitForDebugger);
     app.add_option("--wait-for-pid", waitPid);
@@ -97,6 +101,7 @@ int main(int argc, char* argv[]) {
     app.add_flag("--userfaultfd", userfaultfd,
                  "Enable userfaultfd for tracking memory (Linux only)");
 #endif
+    app.add_option("--user-id", userId, "Use a local user ID for this process only");
 
     app.add_flag("--show-fps", showFps);
     app.add_flag("--config-clean", configClean);
@@ -156,6 +161,13 @@ int main(int argc, char* argv[]) {
     // Load configurations
     EmulatorSettings.Load();
     UserSettings.Load();
+    if (userId) {
+        if (!UserManagement.SetDefaultUserForProcess(*userId)) {
+            LOG_ERROR(Debug, "Local user ID {} does not exist", *userId);
+            return 1;
+        }
+        LOG_INFO(Debug, "Using local user ID {} for this process", *userId);
+    }
 
     if (bigPicture) {
         BigPictureMode::Launch(argv[0], sameProcess);
@@ -217,6 +229,8 @@ int main(int argc, char* argv[]) {
     if (userfaultfd) {
         EmulatorSettings.SetUserfaultfdTracking(true);
     }
+    if (cacheDir)
+        Common::FS::SetUserPath(Common::FS::PathType::CacheDir, *cacheDir);
 
     // ---- Resolve game path or ID ----
     std::filesystem::path ebootPath(*gamePath);

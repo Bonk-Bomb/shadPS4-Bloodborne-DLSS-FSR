@@ -65,6 +65,13 @@ public:
 
     void Mount(const std::filesystem::path& host_folder, const std::string& guest_folder,
                bool read_only = false);
+    /// BBSC mods: puts extra read-only layers (folders or .zar) in front of a mount's stack,
+    /// first in the list = highest priority. Used for the Mods tab's file mods.
+    /// Each overlay: {folder or .zar, prefix}. A prefix ("dvdroot_ps4") means the folder holds
+    /// what the game keeps under that path, so only paths below it reach the layer.
+    void AddOverlays(std::string_view guest_folder,
+                     const std::vector<std::pair<std::filesystem::path, std::string>>& overlays);
+
     void Unmount(const std::string& guest_folder);
     void UnmountAll();
 
