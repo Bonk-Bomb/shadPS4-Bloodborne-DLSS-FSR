@@ -1,0 +1,5 @@
+sha=f76e22fa47f706436ecb4bdd7a87a7bef7376204
+ref=bbsc-dlss-vanilla
+run=https://github.com/Bonk-Bomb/shadPS4-Bloodborne-DLSS-FSR/actions/runs/38899354632
+configure=success
+build=success
