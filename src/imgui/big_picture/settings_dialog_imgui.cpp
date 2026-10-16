@@ -995,10 +995,11 @@ void SettingsWindow::DrawModSetting(const Core::Mods::SettingDef& def, std::stri
 }
 
 void SettingsWindow::DrawModsTab() {
-    ImGuiWindowFlags child_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NavFlattened;
-    ImGui::BeginChild("ContentRegion", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), true,
-                      child_flags);
+    ImGuiChildFlags child_flags = ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened;
+    ImGuiWindowFlags window_flags =
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse;
+    ImGui::BeginChild("ContentRegion", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), child_flags,
+                      window_flags);
 
     const auto modsFolder = Common::FS::GetUserPath(Common::FS::PathType::ModsDir);
     if (ImGui::Button("Open Mods Folder", ImVec2(400.f * uiScale, 0))) {
@@ -1165,10 +1166,11 @@ void SettingsWindow::SaveUsersTab() {
 }
 
 void SettingsWindow::DrawUsersTab() {
-    ImGuiWindowFlags child_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NavFlattened;
-    ImGui::BeginChild("ContentRegion", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), true,
-                      child_flags);
+    ImGuiChildFlags child_flags = ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened;
+    ImGuiWindowFlags window_flags =
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse;
+    ImGui::BeginChild("ContentRegion", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), child_flags,
+                      window_flags);
 
     // A finished "create account" request
     if (createAccountJob.valid() &&

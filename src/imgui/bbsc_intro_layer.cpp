@@ -194,7 +194,7 @@ void IntroLayer::Draw() {
         [&](size_t i) { return EaseOut(Ramp(t, 0.9f + i * 0.07f, 0.6f)) * global; }, 14.0f * s);
 
     // 4. The blood thread under it (just below the letters' baseline), and its drips.
-    const float line_y = title_y + big->Ascent * (title_px / big->FontSize) + title_px * 0.2f;
+    const float line_y = title_y + big->GetFontBaked(title_px)->Ascent + title_px * 0.2f;
     const float half = EaseOut(Ramp(t, 0.6f, 1.3f)) * size.x * 0.30f;
     const float thick = 1.6f * s;
     const ImU32 blood = Rgba(165, 12, 12, global);
