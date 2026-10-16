@@ -55,7 +55,11 @@ jobs:
       run: |
         set -o pipefail
         mkdir -p ci-logs
-        cmake --fresh -G Ninja -B build -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
+        # Branches with "vanilla" in the name build without the built-in BBSC, so the official
+        # bbsc.dll (mods/CUSA03173/bbsc) runs on top and BBSC updates are a DLL swap.
+        variant=""
+        case "$GITHUB_REF_NAME" in *vanilla*) variant="-DBBSC_VANILLA=ON" ;; esac
+        cmake --fresh -G Ninja -B build -DCMAKE_BUILD_TYPE=$BUILD_TYPE $variant \
           -DBB_STREAMLINE_DIR="$STREAMLINE_DIR" \
           -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON \
           -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl \
